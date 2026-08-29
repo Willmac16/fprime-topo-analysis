@@ -187,7 +187,6 @@ and from `<port>_out` invoker names, so telemetry, event, parameter and time
 helpers resolve through the same closure without special-casing.
 
 ```bash
-pip install libclang
 python3 component_call_graph.py \
     --compile-commands build/compile_commands.json \
     --exclude '/test/' --output flow.json
