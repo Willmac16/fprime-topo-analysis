@@ -7,7 +7,7 @@ name = "fprime-topology-analysis"
 version = "0.1.0"
 description = "Static concurrency analysis for F' topologies, joining the FPP model with the C++ implementation"
 readme = "README.md"
-requires-python = ">=3.9"
+requires-python = ">=3.10"
 
 dependencies = [
     # The FPP model. fprime-python-model requires fprime-fpp>=3.3.0, and the
