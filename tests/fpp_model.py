@@ -19,24 +19,18 @@ import subprocess
 from pathlib import Path
 from typing import Iterable, List, Optional, Sequence
 
-# The locations index should cover every definition in the repository,
-# including deployments and subtopologies, so a seed topology can reference
-# them. Alternative subtopology variants deliberately share a base ID range,
-# but that only collides if they are passed to fpp-to-json together, and the
-# dependency closure never pulls in a variant the seed does not use.
+# The locations index should cover every non-ignored definition in the
+# repository, including deployments and subtopologies, so a seed topology can
+# reference them. Alternative subtopology variants deliberately share a base
+# ID range, but that only collides if they are passed to fpp-to-json together,
+# and the dependency closure never pulls in a variant the seed does not use.
 #
-# FppTestProject is excluded because it defines several topologies with
-# deliberately conflicting instances for the FPP compiler's own test suite.
+# These exclusions are semantic rather than generated-file rules, so they do
+# not belong in F Prime's .gitignore. FppTestProject defines several topologies
+# with deliberately conflicting instances for the FPP compiler's own tests.
 DEFINITION_EXCLUDES = (
-    "/.git/",
     "/test/",
     "/FppTestProject/",
-    # Build trees contain copies of the very files being indexed. Indexing both
-    # makes fpp-depend fail with "inconsistent location path", because one
-    # symbol then resolves to two paths.
-    "/build-fprime-",
-    "/build-artifacts/",
-    "/cmake-build-",
 )
 
 MAX_CLOSURE_ITERATIONS = 20
@@ -92,14 +86,42 @@ def find_fprime_root(start: Optional[Path] = None) -> Path:
 
 def definition_sources(root: Path) -> List[Path]:
     """Every .fpp file that only contributes definitions, never instances"""
+    root = root.resolve()
+    result = _run(
+        [
+            "git",
+            "ls-files",
+            "-z",
+            "--cached",
+            "--others",
+            "--exclude-standard",
+            "--",
+            "*.fpp",
+        ],
+        cwd=root,
+    )
+    if result.returncode != 0:
+        raise FppModelError(
+            "git could not list non-ignored FPP sources: " + result.stderr.strip()
+        )
+
     sources = []
-    for path in sorted(root.rglob("*.fpp")):
-        text = str(path)
+    relative_paths = (Path(line) for line in result.stdout.split("\0") if line)
+    for relative_path in sorted(relative_paths):
+        text = "/" + relative_path.as_posix()
         if any(exclude in text for exclude in DEFINITION_EXCLUDES):
             continue
+        path = root / relative_path
         # Any directory holding a CMake cache is a build tree, whatever it is
-        # named, and its .fpp files are copies of ones indexed elsewhere.
-        if any((parent / "CMakeCache.txt").exists() for parent in path.parents):
+        # named, even if that name is not covered by .gitignore. Its .fpp files
+        # are copies of definitions indexed elsewhere. Stop at the checkout
+        # boundary: a cache above it says nothing about this source.
+        source_parents = (path.parent, *path.parent.parents)
+        if any(
+            (parent / "CMakeCache.txt").exists()
+            for parent in source_parents
+            if parent == root or root in parent.parents
+        ):
             continue
         sources.append(path)
     return sources
@@ -108,25 +130,24 @@ def definition_sources(root: Path) -> List[Path]:
 def write_locations_file(root: Path, out_dir: Path) -> Path:
     """Index every definition in the repository into a locations file.
 
-    The locations file must live at the repository root: ``fpp-depend`` resolves
-    the paths inside it relative to the file's own directory.
+    ``fpp-depend`` resolves indexed paths relative to the locations file. Ask
+    ``fpp-locate-defs`` to emit paths relative to the output directory so the
+    file can remain with the other temporary test artifacts.
 
     Raises:
         FppModelError: If fpp-locate-defs fails
     """
     sources = definition_sources(root)
-    result = _run(["fpp-locate-defs"] + [str(s) for s in sources], cwd=root)
+    result = _run(
+        ["fpp-locate-defs", "-d", str(out_dir)] + [str(s) for s in sources],
+        cwd=root,
+    )
     if result.returncode != 0:
         raise FppModelError(f"fpp-locate-defs failed: {result.stderr.strip()}")
 
     locations = out_dir / "locs.fpp"
     locations.write_text(result.stdout)
-
-    # fpp-depend resolves relative paths against the locations file, so keep a
-    # copy at the root where those paths are valid.
-    root_copy = root / ".fpp-analysis-test-locs.fpp"
-    root_copy.write_text(result.stdout)
-    return root_copy
+    return locations
 
 
 def dependency_closure(
