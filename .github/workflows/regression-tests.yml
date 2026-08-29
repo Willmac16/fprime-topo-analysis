@@ -1,0 +1,38 @@
+name: Regression tests
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  pytest:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    env:
+      FPRIME_ROOT: ${{ github.workspace }}/fprime
+
+    steps:
+      - name: Check out topology analysis
+        uses: actions/checkout@v5
+
+      - name: Check out the tested F Prime revision
+        uses: actions/checkout@v5
+        with:
+          repository: nasa/fprime
+          ref: devel
+          path: fprime
+
+      - name: Set up uv
+        uses: astral-sh/setup-uv@v10.0.1
+
+      - name: Install Python and test dependencies
+        run: |
+          uv python install 3.10
+          uv sync --locked --extra test --python 3.10
+
+      - name: Run regression tests
+        run: uv run --locked pytest -q
