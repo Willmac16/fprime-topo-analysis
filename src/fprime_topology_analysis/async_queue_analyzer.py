@@ -6,10 +6,8 @@ Reports queue pressure across an F' topology: for every component queue, which
 producers feed it, on which threads, at what priorities, and - given a rate
 model - how fast it would fill.
 
-A port of the original fprime_async_analyzer onto the shared graph tooling,
-with its analysis and report vocabulary preserved. See the README for what the
-port changed, and ``tools/parity_check.py`` for the evidence that it did not
-change the answers.
+The queue report, JSON output, and diagram all use the shared topology graph
+and C++ flow model.
 
 Copyright 2026, by the California Institute of Technology.
 ALL RIGHTS RESERVED. United States Government Sponsorship acknowledged.
@@ -27,7 +25,15 @@ from typing import Dict, List, Optional, Set, Tuple
 
 from . import cli
 from .port_flow import UnresolvedFlowError
-from .topology_graph import STOP, Hop, InstanceInfo, PortKey, SyncKind, TopologyGraph
+from .topology_graph import (
+    DEFAULT_QUEUE_FULL,
+    STOP,
+    Hop,
+    InstanceInfo,
+    PortKey,
+    SyncKind,
+    TopologyGraph,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -476,11 +482,16 @@ def render_markdown(
         )
         drain_statuses = iter(summarize_component_priority_status(row))
         previous_type: Optional[str] = None
+        previous_producer: Optional[str] = None
 
         for group, producers in groups:
             for index, (producer, emoji) in enumerate(producers):
                 cells = dict.fromkeys(COLUMNS, "")
                 cells.update(_producer_cells(producer, emoji, producer_verbose))
+                if producer.source and producer.source == previous_producer:
+                    cells["Async Producer"] = "^"
+                else:
+                    previous_producer = producer.source or None
                 cells["Drain Thread Priority"] = next(drain_statuses, "")
                 if index == 0:
                     cells["Destination Port"] = group.destination_port
@@ -762,6 +773,29 @@ class _Queue:
     production_hz: Optional[float] = None
 
 
+def _destination_queue_entries(
+    info: InstanceInfo, port: str, data_type: str
+) -> List[Tuple[str, str, str]]:
+    """Expand a physical input into independently queued message kinds."""
+    if port != info.cmd_port:
+        return [
+            (port, data_type, info.port_queue_full.get(port, DEFAULT_QUEUE_FULL))
+        ]
+
+    commands = [
+        (
+            f"{port}:{mnemonic}",
+            data_type,
+            info.command_queue_full.get(mnemonic, DEFAULT_QUEUE_FULL),
+        )
+        for mnemonic, kinds in sorted(info.command_kinds.items())
+        if SyncKind.ASYNC in kinds
+    ]
+    return commands or [
+        (port, data_type, info.port_queue_full.get(port, DEFAULT_QUEUE_FULL))
+    ]
+
+
 def analyze(graph: TopologyGraph, rate_model: Dict) -> List[QueueGroup]:
     """Group every async queue in the topology with the producers feeding it"""
     thread_cache: Dict[str, InstanceThreadInfo] = {}
@@ -803,33 +837,35 @@ def analyze(graph: TopologyGraph, rate_model: Dict) -> List[QueueGroup]:
         queue.inbound.add(source_name)
         queue.data_types.add(data_type)
 
-        port_queue = queue.ports.setdefault(
-            (dest.port, data_type),
-            _PortQueue(dest_info.port_queue_full.get(dest.port, "assert")),
-        )
-        if source_name in port_queue.sources:
-            continue
-        port_queue.sources.add(source_name)
-
         source = connection.source.port
         source_thread = thread_info(source.instance)
         production_hz = lookup_rate(
             producer_overrides,
             [source_name, f"{source.instance}.{source.port}", source.instance],
         )
-        port_queue.production_hz = _add_rate(port_queue.production_hz, production_hz)
         queue.production_hz = _add_rate(queue.production_hz, production_hz)
-        port_queue.producers.append(
-            InboundProducer(
-                source=source_name,
-                thread_kind=source_thread.kind,
-                thread_priority=source_thread.priority,
-                drain_source=source_thread.drain_source,
-                thread_context=source_thread.context,
-                emit_context=emit_context(source.instance, source.port),
-                production_hz=production_hz,
-            )
+        producer = InboundProducer(
+            source=source_name,
+            thread_kind=source_thread.kind,
+            thread_priority=source_thread.priority,
+            drain_source=source_thread.drain_source,
+            thread_context=source_thread.context,
+            emit_context=emit_context(source.instance, source.port),
+            production_hz=production_hz,
         )
+        for port_name, entry_type, queue_full in _destination_queue_entries(
+            dest_info, dest.port, data_type
+        ):
+            port_queue = queue.ports.setdefault(
+                (port_name, entry_type), _PortQueue(queue_full)
+            )
+            if source_name in port_queue.sources:
+                continue
+            port_queue.sources.add(source_name)
+            port_queue.production_hz = _add_rate(
+                port_queue.production_hz, production_hz
+            )
+            port_queue.producers.append(producer)
 
     rows: List[QueueGroup] = []
     for instance_name, queue in sorted(queues.items()):
@@ -916,7 +952,7 @@ def format_requeue_drops(drops: List[RequeueDrop]) -> str:
 
 
 def rows_to_payload(rows: List[QueueGroup], include_rates: bool) -> List[Dict]:
-    """Structured output, preserving the original JSON shape"""
+    """Build the structured queue-analysis output."""
     payload = []
     for row in rows:
         item = {

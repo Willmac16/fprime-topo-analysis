@@ -171,6 +171,10 @@ class InstanceInfo:
     cmd_port: Optional[str] = None
     # Command mnemonic -> dispatch kinds
     command_kinds: Dict[str, Set[SyncKind]] = field(default_factory=dict)
+    # Async command mnemonic -> queue priority/queue-full behavior. Commands
+    # share one Fw.Cmd port, but these properties belong to each command.
+    command_priorities: Dict[str, int] = field(default_factory=dict)
+    command_queue_full: Dict[str, str] = field(default_factory=dict)
 
     @property
     def queue_size(self) -> Optional[int]:
@@ -610,6 +614,27 @@ class TopologyGraph:
             result.setdefault(mnemonic, set()).add(self._command_kind(command))
         return result
 
+    def _async_command_queue_properties(
+        self, ci: fpm_ComponentInstance
+    ) -> Tuple[Dict[str, int], Dict[str, str]]:
+        """Return per-command queue properties for async commands."""
+        priorities: Dict[str, int] = {}
+        queue_full: Dict[str, str] = {}
+        for command in ci.component.command_map.values():
+            if not (
+                isinstance(command, fpm_command.CommandNonParam)
+                and isinstance(command.kind, fpm_command.NonParamKindAsync)
+            ):
+                continue
+            try:
+                mnemonic = str(command.get_name())
+            except (AttributeError, TypeError):
+                continue
+            if command.kind.priority is not None:
+                priorities[mnemonic] = int(command.kind.priority)
+            queue_full[mnemonic] = str(command.kind.queue_full)
+        return priorities, queue_full
+
     def _build_instances(self) -> None:
         """Index every component instance's ports by dispatch kind"""
         for interface_instance in self.topology.instance_map:
@@ -654,6 +679,10 @@ class TopologyGraph:
                     info.cmd_port = str(port_name)
 
             info.command_kinds = self._command_kinds_by_mnemonic(ci)
+            (
+                info.command_priorities,
+                info.command_queue_full,
+            ) = self._async_command_queue_properties(ci)
             self.instances[name] = info
             logger.debug(
                 f"  {name} ({info.kind}): {len(info.input_ports)} inputs, "

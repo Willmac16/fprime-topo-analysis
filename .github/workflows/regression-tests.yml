@@ -36,3 +36,44 @@ jobs:
 
       - name: Run regression tests
         run: uv run --locked pytest -q
+
+  end-user-tools:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+
+    steps:
+      - name: Check out topology analysis
+        uses: actions/checkout@v5
+
+      - name: Check out F Prime devel
+        uses: actions/checkout@v5
+        with:
+          repository: nasa/fprime
+          ref: devel
+          path: fprime
+
+      - name: Set up uv
+        uses: astral-sh/setup-uv@v10.0.1
+
+      - name: Install analyzer and F Prime environments
+        run: |
+          uv python install 3.10
+          uv sync --locked --extra test --python 3.10
+          uv venv fprime/.venv --python 3.10
+          uv pip sync --python fprime/.venv/bin/python fprime/requirements.txt
+
+      - name: Run installed tools on an F Prime deployment
+        run: |
+          source .venv/bin/activate
+          deployment=fprime/TestDeploymentsProject
+          reports="$RUNNER_TEMP/fprime-topology-analysis"
+          mkdir -p "$reports"
+          fprime-topology-checks "$deployment" --fail-on never \
+            --output "$reports/topology-checks.md"
+          fprime-guarded-port-analyzer "$deployment" --fail-on never \
+            --output "$reports/guarded-ports.md"
+          fprime-async-queue-analyzer "$deployment" --hide-drop-ports \
+            --output "$reports/async-queues.md"
+          test -s "$reports/topology-checks.md"
+          test -s "$reports/guarded-ports.md"
+          test -s "$reports/async-queues.md"

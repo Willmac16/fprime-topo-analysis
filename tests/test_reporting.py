@@ -123,6 +123,33 @@ def test_drop_port_filter_removes_groups_and_empty_queues():
     assert filtered[0].total_production_hz == 2.0
 
 
+def test_fw_cmd_queue_behavior_is_per_command(graph_builder):
+    graph = graph_builder("command_queue_behavior")
+    command_target = graph.instances["T.target"]
+    assert command_target.command_priorities == {"DISCARD": 9, "KEEP": 3}
+    assert command_target.command_queue_full == {
+        "DISCARD": "drop",
+        "KEEP": "assert",
+    }
+
+    rows = analyze(graph, {})
+
+    assert len(rows) == 1
+    groups = {group.destination_port: group for group in rows[0].inbound_ports}
+    assert groups["cmdIn:DISCARD"].overflow_behavior == "drop"
+    assert groups["cmdIn:KEEP"].overflow_behavior == "assert"
+
+    report = render_markdown(rows, include_rates=False)
+    assert report.count("T.source.cmdOut") == 1
+    assert "| ^ | passive" in report
+
+    filtered = filter_drop_ports(rows)
+
+    assert [group.destination_port for group in filtered[0].inbound_ports] == [
+        "cmdIn:KEEP"
+    ]
+
+
 def test_connection_order_is_stable(graph_builder):
     """Two graphs built from one model agree on destination order
 
