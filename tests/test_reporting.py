@@ -10,7 +10,15 @@ Copyright 2026, by the California Institute of Technology.
 ALL RIGHTS RESERVED. United States Government Sponsorship acknowledged.
 """
 
-from fprime_topology_analysis.async_queue_analyzer import analyze, render_mermaid
+from fprime_topology_analysis.async_queue_analyzer import (
+    InboundAsyncPortGroup,
+    InboundProducer,
+    QueueGroup,
+    analyze,
+    filter_drop_ports,
+    render_markdown,
+    render_mermaid,
+)
 from fprime_topology_analysis.checks import run_checks
 
 
@@ -24,6 +32,95 @@ def test_mermaid_diagram_renders(graph_builder):
     # Instance names are sanitized into mermaid-safe node ids
     assert "T_urgent" in diagram
     assert "T.urgent" in diagram
+
+
+def test_queue_report_explains_colors_and_shares_drain_count_rows():
+    producers = [
+        InboundProducer(
+            source="active",
+            thread_kind="active",
+            thread_priority=20,
+        ),
+        InboundProducer(
+            source="passive",
+            thread_kind="passive",
+            emit_context="sync input handler recv",
+        ),
+    ]
+    row = QueueGroup(
+        destination="queue",
+        queue_size=10,
+        drain_thread_kind="active",
+        drain_thread_priority=10,
+        drain_drain_source=None,
+        drain_context="",
+        inbound_ports=[InboundAsyncPortGroup(producers=producers)],
+        inbound=[],
+        data_types=[],
+        total_production_hz=None,
+        consumer_rate_hz=None,
+        queue_fill_time_s=None,
+    )
+
+    report = render_markdown([row], include_rates=False)
+
+    assert "🟠 caller-thread priority is unresolved" in report
+    lines = report.splitlines()
+    destination = next(index for index, line in enumerate(lines) if "| queue |" in line)
+    assert "| 10 | active | 10 |" in lines[destination]
+    active = next(line for line in lines if "| active | active |" in line)
+    passive = next(line for line in lines if "| passive | passive" in line)
+    assert "|  |  | 🔴 1 |" in active
+    assert "|  |  | 🟠 1 |" in passive
+    assert "<br" not in report
+
+
+def test_drop_port_filter_removes_groups_and_empty_queues():
+    keep = InboundAsyncPortGroup(
+        destination_port="keep",
+        data_type="Keep",
+        overflow_behavior="assert",
+        producers=[InboundProducer(source="keep.out")],
+        total_production_hz=2.0,
+    )
+    drop = InboundAsyncPortGroup(
+        destination_port="discard",
+        data_type="Drop",
+        overflow_behavior="drop",
+        producers=[InboundProducer(source="drop.out")],
+        total_production_hz=10.0,
+    )
+    base = {
+        "queue_size": 10,
+        "drain_thread_kind": "active",
+        "drain_thread_priority": 10,
+        "drain_drain_source": None,
+        "drain_context": "",
+        "data_types": ["Drop", "Keep"],
+        "total_production_hz": 12.0,
+        "consumer_rate_hz": 1.0,
+        "queue_fill_time_s": 1.0,
+    }
+    mixed = QueueGroup(
+        destination="mixed",
+        inbound_ports=[keep, drop],
+        inbound=["drop.out", "keep.out"],
+        **base,
+    )
+    only_drop = QueueGroup(
+        destination="onlyDrop",
+        inbound_ports=[drop],
+        inbound=["drop.out"],
+        **base,
+    )
+
+    filtered = filter_drop_ports([mixed, only_drop])
+
+    assert [row.destination for row in filtered] == ["mixed"]
+    assert [group.destination_port for group in filtered[0].inbound_ports] == ["keep"]
+    assert filtered[0].inbound == ["keep.out"]
+    assert filtered[0].data_types == ["Keep"]
+    assert filtered[0].total_production_hz == 2.0
 
 
 def test_connection_order_is_stable(graph_builder):

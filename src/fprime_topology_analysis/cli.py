@@ -66,6 +66,13 @@ class DeploymentSource:
     topology_name: str
 
 
+def _positive_int(value: str) -> int:
+    parsed = int(value)
+    if parsed < 1:
+        raise argparse.ArgumentTypeError("must be at least 1")
+    return parsed
+
+
 def add_topology_args(parser: argparse.ArgumentParser) -> None:
     """Add the source-context options shared by every analyzer."""
     parser.add_argument(
@@ -74,6 +81,12 @@ def add_topology_args(parser: argparse.ArgumentParser) -> None:
         type=Path,
         metavar="PROJECT_OR_DEPLOYMENT",
         help="F Prime project or deployment source directory (default: current directory)",
+    )
+    parser.add_argument(
+        "-j",
+        "--jobs",
+        type=_positive_int,
+        help="Maximum C++ parsing workers (default: all logical CPU cores)",
     )
     parser.add_argument(
         "--permissive",
@@ -392,6 +405,27 @@ def _cmake_home(build_cache: Path, fallback: Path) -> Path:
     return Path(match.group(1)).resolve() if match else fallback
 
 
+def _analysis_options_enabled(build_cache: Path) -> bool:
+    """Return whether an existing cache emits both analysis inputs."""
+    try:
+        cache = (build_cache / "CMakeCache.txt").read_text(errors="replace")
+    except OSError:
+        return False
+    enabled = {"1", "ON", "TRUE", "YES", "Y"}
+    values = dict(
+        re.findall(
+            r"^(FPRIME_ENABLE_JSON_MODEL_GENERATION|CMAKE_EXPORT_COMPILE_COMMANDS)"
+            r":[^=]+=(\S+)\s*$",
+            cache,
+            re.MULTILINE,
+        )
+    )
+    return all(values.get(option, "").upper() in enabled for option in (
+        "FPRIME_ENABLE_JSON_MODEL_GENERATION",
+        "CMAKE_EXPORT_COMPILE_COMMANDS",
+    ))
+
+
 def _prepare_analysis(source: DeploymentSource) -> None:
     venv, executable = _project_venv(source)
     environment = os.environ.copy()
@@ -402,7 +436,7 @@ def _prepare_analysis(source: DeploymentSource) -> None:
     )
     environment.pop("PYTHONHOME", None)
 
-    logger.info(f"Preparing analysis data for {source.deployment_dir}")
+    logger.info(f"Checking analysis inputs for {source.deployment_dir}")
     build_cache = _release_build_cache(executable, source, environment)
     if build_cache is None:
         _prepare_command(
@@ -415,7 +449,7 @@ def _prepare_analysis(source: DeploymentSource) -> None:
             source,
             environment,
         )
-    else:
+    elif not _analysis_options_enabled(build_cache):
         cmake = executable.parent / ("cmake.exe" if os.name == "nt" else "cmake")
         if not cmake.is_file():
             raise CliError(
@@ -444,13 +478,8 @@ def resolve_analysis_artifacts(args, *, require_cpp: bool = True) -> AnalysisArt
         return cached
 
     source = resolve_deployment_source(args)
+    _prepare_analysis(source)
     artifacts = _available_artifacts(source)
-    needs_preparation = artifacts is None or (
-        require_cpp and artifacts.compile_commands is None
-    )
-    if needs_preparation:
-        _prepare_analysis(source)
-        artifacts = _available_artifacts(source)
 
     if artifacts is None:
         raise CliError(
@@ -483,6 +512,12 @@ def load_flow(args, *, allow_empty: bool = False) -> PortFlowMap:
         data = CallGraphExtractor(
             compile_commands=artifacts.compile_commands,
             exclude_pattern=r"/(?:test|tests)/",
+            jobs=getattr(args, "jobs", None),
+            unit_cache_dir=(
+                artifacts.compile_commands.parent
+                / ".fprime-topology-analysis"
+                / "units"
+            ),
         ).run()
     except (RuntimeError, FileNotFoundError, ValueError) as error:
         if allow_empty:

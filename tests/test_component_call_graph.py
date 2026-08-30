@@ -10,14 +10,196 @@ Copyright 2026, by the California Institute of Technology.
 ALL RIGHTS RESERVED. United States Government Sponsorship acknowledged.
 """
 
+from io import StringIO
+from pathlib import Path
+from types import SimpleNamespace
+
 import pytest
 
-from fprime_topology_analysis.component_call_graph import CallGraphExtractor
+from fprime_topology_analysis.component_call_graph import (
+    CallGraphExtractor,
+    MethodInfo,
+    _UnitResult,
+    _TranslationUnitProgress,
+    detect_host_libclang,
+)
 from fprime_topology_analysis.port_flow import PortFlowMap, UnresolvedFlowError
 
 
 def handlers_of(flow_map, component):
     return flow_map["components"][component]["handlers"]
+
+
+class TerminalBuffer(StringIO):
+    def isatty(self):
+        return True
+
+
+def test_translation_unit_progress_uses_single_terminal_line():
+    stream = TerminalBuffer()
+    times = iter((100.0, 100.0, 102.0, 104.0))
+    progress = _TranslationUnitProgress(
+        4, stream=stream, update_interval=0, clock=lambda: next(times)
+    )
+
+    progress.update(0, force=True)
+    progress.update(2)
+    progress.finish(4)
+
+    output = stream.getvalue()
+    assert (
+        "\r\033[2K⠋ Parsing C++ 0/4 [░░░░░░░░░░░░░░░░░░░░░░░░]   0% "
+        "00:00 ETA --:--" in output
+    )
+    assert (
+        "\r\033[2K⠹ Parsing C++ 2/4 [████████████░░░░░░░░░░░░]  50% "
+        "00:02 ETA 00:02" in output
+    )
+    assert (
+        "\r\033[2K⠼ Parsing C++ 4/4 [████████████████████████] 100% "
+        "00:04 ETA 00:00" in output
+    )
+    assert output.endswith("\n")
+
+
+def test_translation_unit_progress_is_silent_without_terminal():
+    stream = StringIO()
+    progress = _TranslationUnitProgress(4, stream=stream, update_interval=0)
+
+    progress.update(2, force=True)
+    progress.finish(4)
+
+    assert stream.getvalue() == ""
+
+
+def test_detect_host_libclang_from_selected_xcode(monkeypatch, tmp_path):
+    compiler = tmp_path / "Toolchain" / "usr" / "bin" / "clang"
+    library = tmp_path / "Toolchain" / "usr" / "lib" / "libclang.dylib"
+    library.parent.mkdir(parents=True)
+    library.touch()
+    monkeypatch.setattr("sys.platform", "darwin")
+    def xcrun(*_args, **_kwargs):
+        return SimpleNamespace(returncode=0, stdout=f"{compiler}\n", stderr="")
+
+    monkeypatch.setattr("subprocess.run", xcrun)
+
+    assert detect_host_libclang() == Path(library)
+
+
+def test_parallel_parse_uses_at_most_one_worker_per_unit(monkeypatch, tmp_path):
+    import json
+
+    sources = []
+    for index in range(3):
+        source = tmp_path / f"Source{index}.cpp"
+        source.write_text("")
+        sources.append(source)
+    database = tmp_path / "compile_commands.json"
+    database.write_text(
+        json.dumps(
+            [
+                {
+                    "directory": str(tmp_path),
+                    "file": str(source),
+                    "arguments": ["c++", "-c", str(source)],
+                }
+                for source in sources
+            ]
+        )
+    )
+    extractor = CallGraphExtractor(
+        database, system_includes=[], jobs=8
+    )
+    selected_workers = []
+
+    def fake_parallel_results(units, workers):
+        selected_workers.append(workers)
+        for _ in units:
+            yield _UnitResult({}, {}, 1, [], set(), 0, [], set(), set())
+
+    monkeypatch.setattr(extractor, "_parallel_results", fake_parallel_results)
+
+    extractor.run()
+
+    assert selected_workers == [3]
+    assert extractor.parsed_files == 3
+
+
+def test_flow_cache_reuses_unchanged_units_and_invalidates_dependencies(tmp_path):
+    source = tmp_path / "Thing.cpp"
+    header = tmp_path / "Thing.hpp"
+    source.write_text('#include "Thing.hpp"\n')
+    header.write_text("struct Thing {};\n")
+    database = tmp_path / "compile_commands.json"
+    database.write_text("[]")
+    extractor = CallGraphExtractor(
+        database,
+        system_includes=[],
+        jobs=1,
+        unit_cache_dir=tmp_path / "cache" / "units",
+    )
+    args = ["-std=c++17"]
+    method = MethodInfo("Thing", "run", ports={"out"})
+    result = _UnitResult(
+        {method.key: method},
+        {"Thing": "Demo.Thing"},
+        1,
+        [],
+        set(),
+        0,
+        [],
+        set(),
+        {str(source), str(header)},
+    )
+
+    extractor._write_cached_unit(source, args, result)
+    cached = extractor._read_cached_unit(source, args)
+
+    assert cached is not None
+    assert cached.methods[method.key].ports == {"out"}
+
+    extractor.dependencies = {str(source), str(header)}
+    flow = {"version": 1, "components": {}}
+    extractor._write_cached_flow(flow)
+    assert extractor._read_cached_flow() == flow
+
+    header.write_text("struct Thing { int changed; };\n")
+
+    assert extractor._read_cached_unit(source, args) is None
+    assert extractor._read_cached_flow() is None
+
+
+def test_unit_cache_reuses_missing_generated_header_until_it_appears(tmp_path):
+    source = tmp_path / "Thing.cpp"
+    source.write_text('#include "ThingComponentAc.hpp"\n')
+    database = tmp_path / "compile_commands.json"
+    database.write_text("[]")
+    extractor = CallGraphExtractor(
+        database,
+        system_includes=[],
+        jobs=1,
+        unit_cache_dir=tmp_path / "cache" / "units",
+    )
+    args = ["-I", str(tmp_path)]
+    result = _UnitResult(
+        {},
+        {},
+        0,
+        [],
+        set(),
+        0,
+        [str(source)],
+        {"ThingComponentAc.hpp"},
+        {str(source)},
+    )
+
+    extractor._write_cached_unit(source, args, result)
+
+    assert extractor._read_cached_unit(source, args) is not None
+
+    (tmp_path / "ThingComponentAc.hpp").write_text("// generated\n")
+
+    assert extractor._read_cached_unit(source, args) is None
 
 
 def test_libclang_darwin_attribute_cursor_kinds_are_supported(tmp_path):

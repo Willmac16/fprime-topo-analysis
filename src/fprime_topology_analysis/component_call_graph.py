@@ -36,18 +36,26 @@ Copyright 2026, by the California Institute of Technology.
 ALL RIGHTS RESERVED. United States Government Sponsorship acknowledged.
 """
 
+import hashlib
 import json
 import logging
+import multiprocessing
+import os
 import re
 import subprocess
+import sys
+import tempfile
+import time
+from concurrent.futures import ProcessPoolExecutor
 from contextlib import suppress
 from pathlib import Path
-from typing import Dict, List, Optional, Set, Tuple
+from typing import Callable, Dict, List, Optional, Set, TextIO, Tuple
 from dataclasses import dataclass, field
 
 logger = logging.getLogger(__name__)
 
 FLOW_FORMAT_VERSION = 1
+UNIT_CACHE_VERSION = 1
 
 # Generated naming conventions used to recognize port invocations
 OUTPUT_PORT_MEMBER_RE = re.compile(r"^m_(?P<port>\w+)_OutputPort$")
@@ -86,6 +94,87 @@ LOCK_TYPE_MARKERS = ("Mutex", "ScopeLock", "Semaphore", "SpinLock")
 # Assignment forms that make the left hand side a write
 ASSIGN_TOKEN = "="
 INCREMENT_TOKENS = {"++", "--"}
+
+BRAILLE_SPINNER = ("⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏")
+
+
+class _TranslationUnitProgress:
+    """Render throttled translation-unit progress on one terminal line."""
+
+    def __init__(
+        self,
+        total: int,
+        *,
+        stream: Optional[TextIO] = None,
+        update_interval: float = 0.1,
+        clock: Callable[[], float] = time.monotonic,
+    ):
+        self.total = total
+        self.stream = stream or sys.stderr
+        self.update_interval = update_interval
+        self.clock = clock
+        self.started_at = self.clock()
+        self.last_update = float("-inf")
+        self.enabled = self.stream.isatty() and not logger.isEnabledFor(logging.DEBUG)
+
+    @staticmethod
+    def _duration(seconds: float) -> str:
+        seconds = max(0, int(seconds))
+        return f"{seconds // 60:02d}:{seconds % 60:02d}"
+
+    def update(self, completed: int, *, force: bool = False) -> None:
+        if not self.enabled:
+            return
+        now = self.clock()
+        if not force and now - self.last_update < self.update_interval:
+            return
+
+        fraction = completed / self.total if self.total else 1.0
+        bar_width = 24
+        filled = min(bar_width, int(bar_width * fraction))
+        bar = "█" * filled + "░" * (bar_width - filled)
+        spinner = BRAILLE_SPINNER[completed % len(BRAILLE_SPINNER)]
+        elapsed = max(0.0, now - self.started_at)
+        elapsed_text = self._duration(elapsed)
+        if completed >= self.total:
+            eta_text = "00:00"
+        elif completed > 0 and elapsed > 0:
+            eta_text = self._duration(elapsed * (self.total - completed) / completed)
+        else:
+            eta_text = "--:--"
+        percent = min(100, int(fraction * 100))
+        self.stream.write(
+            f"\r\033[2K{spinner} Parsing C++ {completed}/{self.total} "
+            f"[{bar}] {percent:3d}% {elapsed_text} ETA {eta_text}"
+        )
+        self.stream.flush()
+        self.last_update = now
+
+    def finish(self, completed: int) -> None:
+        if not self.enabled:
+            return
+        self.update(completed, force=True)
+        self.stream.write("\n")
+        self.stream.flush()
+
+
+def detect_host_libclang() -> Optional[Path]:
+    """Find the libclang supplied by the selected macOS developer toolchain."""
+    if sys.platform != "darwin":
+        return None
+    try:
+        result = subprocess.run(
+            ("xcrun", "--find", "clang"),
+            capture_output=True,
+            text=True,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return None
+    if result.returncode != 0:
+        return None
+    compiler = Path(result.stdout.strip())
+    library = compiler.parent.parent / "lib" / "libclang.dylib"
+    return library if library.is_file() else None
 
 
 def detect_system_includes() -> List[str]:
@@ -159,6 +248,61 @@ class MethodInfo:
         return (self.cls, self.name)
 
 
+@dataclass
+class _UnitResult:
+    methods: Dict[Tuple[str, str], MethodInfo]
+    class_component: Dict[str, str]
+    parsed_files: int
+    failed_files: List[str]
+    files_with_errors: Set[str]
+    diagnostic_count: int
+    not_generated: List[str]
+    missing_autocode: Set[str]
+    dependencies: Set[str]
+
+
+_WORKER_CINDEX = None
+_WORKER_INDEX = None
+
+
+def _initialize_parse_worker(libclang_path: Optional[str]) -> None:
+    """Give each process its own libclang index."""
+    global _WORKER_CINDEX, _WORKER_INDEX
+    extractor = CallGraphExtractor(
+        Path("compile_commands.json"),
+        libclang_path=libclang_path,
+        system_includes=[],
+        jobs=1,
+    )
+    _WORKER_CINDEX, _WORKER_INDEX = extractor.create_parser()
+    logger.disabled = True
+
+
+def _parse_unit_worker(unit: Tuple[Path, List[str]]) -> _UnitResult:
+    """Parse one unit without sharing mutable extractor state."""
+    source, args = unit
+    extractor = CallGraphExtractor(
+        Path("compile_commands.json"), system_includes=[], jobs=1
+    )
+    extractor.parse_unit_with(source, args, _WORKER_CINDEX, _WORKER_INDEX)
+    return _extract_unit_result(extractor)
+
+
+def _extract_unit_result(extractor: "CallGraphExtractor") -> _UnitResult:
+    """Detach the serializable state produced by one translation unit."""
+    return _UnitResult(
+        methods=extractor.methods,
+        class_component=extractor.class_component,
+        parsed_files=extractor.parsed_files,
+        failed_files=extractor.failed_files,
+        files_with_errors=extractor.files_with_errors,
+        diagnostic_count=extractor.diagnostic_count,
+        not_generated=extractor.not_generated,
+        missing_autocode=extractor.missing_autocode,
+        dependencies=extractor.dependencies,
+    )
+
+
 class CallGraphExtractor:
     """Builds a member-function call graph and resolves handler port usage"""
 
@@ -169,6 +313,8 @@ class CallGraphExtractor:
         exclude_pattern: Optional[str] = None,
         libclang_path: Optional[str] = None,
         system_includes: Optional[List[str]] = None,
+        jobs: Optional[int] = None,
+        unit_cache_dir: Optional[Path] = None,
     ):
         self.compile_commands = compile_commands
         self.system_includes = (
@@ -177,6 +323,9 @@ class CallGraphExtractor:
         self.include_re = re.compile(include_pattern) if include_pattern else None
         self.exclude_re = re.compile(exclude_pattern) if exclude_pattern else None
         self.libclang_path = libclang_path
+        self.jobs = max(1, jobs if jobs is not None else (os.cpu_count() or 1))
+        self.unit_cache_dir = unit_cache_dir
+        self.cache_version = hashlib.sha256(Path(__file__).read_bytes()).hexdigest()
 
         self.methods: Dict[Tuple[str, str], MethodInfo] = {}
         # Implementation class -> FPP component it implements, by inheritance
@@ -189,7 +338,260 @@ class CallGraphExtractor:
         # include a generated header that was never produced
         self.not_generated: List[str] = []
         self.missing_autocode: Set[str] = set()
+        self.dependencies: Set[str] = set()
         self._source_cache: Dict[str, str] = {}
+
+    def _merge_unit_result(self, result: _UnitResult) -> None:
+        """Merge one worker result in compilation-database order."""
+        self.methods.update(result.methods)
+        self.class_component.update(result.class_component)
+        self.parsed_files += result.parsed_files
+        self.failed_files.extend(result.failed_files)
+        self.files_with_errors.update(result.files_with_errors)
+        self.diagnostic_count += result.diagnostic_count
+        self.not_generated.extend(result.not_generated)
+        self.missing_autocode.update(result.missing_autocode)
+        self.dependencies.update(result.dependencies)
+
+    def create_parser(self):
+        """Create the libclang objects owned by one parsing process."""
+        cindex = self._load_clang()
+        return cindex, cindex.Index.create()
+
+    def parse_unit_with(self, source: Path, args: List[str], cindex, index) -> None:
+        """Parse one unit using parser objects owned by the current process."""
+        self._cindex = cindex
+        self._index = index
+        self.parse_unit(source, args)
+
+    def _unit_cache_file(self, source: Path) -> Optional[Path]:
+        if self.unit_cache_dir is None:
+            return None
+        name = hashlib.sha256(str(source.resolve()).encode()).hexdigest()
+        return self.unit_cache_dir / f"{name}.json"
+
+    @staticmethod
+    def _method_to_data(method: MethodInfo) -> dict:
+        return {
+            "cls": method.cls,
+            "name": method.name,
+            "calls": [list(call) for call in sorted(method.calls)],
+            "ports": sorted(method.ports),
+            "guarded_ports": sorted(method.guarded_ports),
+            "fields_read": sorted(method.fields_read),
+            "fields_written": sorted(method.fields_written),
+            "event_severities": sorted(method.event_severities),
+            "locks_touched": sorted(method.locks_touched),
+            "opaque": method.opaque,
+        }
+
+    @staticmethod
+    def _method_from_data(data: dict) -> MethodInfo:
+        return MethodInfo(
+            cls=data["cls"],
+            name=data["name"],
+            calls={tuple(call) for call in data["calls"]},
+            ports=set(data["ports"]),
+            guarded_ports=set(data["guarded_ports"]),
+            fields_read=set(data["fields_read"]),
+            fields_written=set(data["fields_written"]),
+            event_severities=set(data["event_severities"]),
+            locks_touched=set(data["locks_touched"]),
+            opaque=data["opaque"],
+        )
+
+    def _result_to_data(self, result: _UnitResult) -> dict:
+        return {
+            "methods": [
+                self._method_to_data(method)
+                for _, method in sorted(result.methods.items())
+            ],
+            "class_component": result.class_component,
+            "parsed_files": result.parsed_files,
+            "failed_files": result.failed_files,
+            "files_with_errors": sorted(result.files_with_errors),
+            "diagnostic_count": result.diagnostic_count,
+            "not_generated": result.not_generated,
+            "missing_autocode": sorted(result.missing_autocode),
+            "dependencies": sorted(result.dependencies),
+        }
+
+    def _result_from_data(self, data: dict) -> _UnitResult:
+        methods = [self._method_from_data(method) for method in data["methods"]]
+        return _UnitResult(
+            methods={method.key: method for method in methods},
+            class_component=dict(data["class_component"]),
+            parsed_files=data["parsed_files"],
+            failed_files=list(data["failed_files"]),
+            files_with_errors=set(data["files_with_errors"]),
+            diagnostic_count=data["diagnostic_count"],
+            not_generated=list(data["not_generated"]),
+            missing_autocode=set(data["missing_autocode"]),
+            dependencies=set(data["dependencies"]),
+        )
+
+    @staticmethod
+    def _dependency_stamps(paths: Set[str]) -> Optional[dict]:
+        stamps = {}
+        for path_text in sorted(paths):
+            try:
+                stat = Path(path_text).stat()
+            except OSError:
+                return None
+            stamps[path_text] = [stat.st_mtime_ns, stat.st_size]
+        return stamps
+
+    def _missing_header_available(self, args: List[str], headers: Set[str]) -> bool:
+        include_dirs: List[Path] = []
+        index = 0
+        while index < len(args):
+            arg = args[index]
+            if arg in {"-I", "-isystem", "-iquote"} and index + 1 < len(args):
+                include_dirs.append(Path(args[index + 1]))
+                index += 2
+                continue
+            for prefix in ("-I", "-isystem", "-iquote"):
+                if arg.startswith(prefix) and len(arg) > len(prefix):
+                    include_dirs.append(Path(arg[len(prefix) :]))
+                    break
+            index += 1
+        return any(
+            (directory / header).is_file()
+            for directory in include_dirs
+            for header in headers
+        )
+
+    def _read_cached_unit(
+        self, source: Path, args: List[str]
+    ) -> Optional[_UnitResult]:
+        cache_file = self._unit_cache_file(source)
+        if cache_file is None:
+            return None
+        try:
+            payload = json.loads(cache_file.read_text())
+            if (
+                payload["version"] != UNIT_CACHE_VERSION
+                or payload["extractor"] != self.cache_version
+                or payload["args"] != args
+            ):
+                return None
+            dependencies = payload["dependencies"]
+            for path_text, expected in dependencies.items():
+                stat = Path(path_text).stat()
+                if [stat.st_mtime_ns, stat.st_size] != expected:
+                    return None
+            result = self._result_from_data(payload["result"])
+            if result.missing_autocode and self._missing_header_available(
+                args, result.missing_autocode
+            ):
+                return None
+            return result
+        except (KeyError, OSError, TypeError, ValueError, json.JSONDecodeError):
+            return None
+
+    def _write_cached_unit(
+        self, source: Path, args: List[str], result: _UnitResult
+    ) -> None:
+        cache_file = self._unit_cache_file(source)
+        if (
+            cache_file is None
+            or (result.parsed_files != 1 and not result.not_generated)
+            or result.failed_files
+            or result.diagnostic_count
+        ):
+            return
+        dependencies = self._dependency_stamps(result.dependencies)
+        if not dependencies:
+            return
+        temporary: Optional[Path] = None
+        try:
+            cache_file.parent.mkdir(parents=True, exist_ok=True)
+            payload = {
+                "version": UNIT_CACHE_VERSION,
+                "extractor": self.cache_version,
+                "args": args,
+                "dependencies": dependencies,
+                "result": self._result_to_data(result),
+            }
+            with tempfile.NamedTemporaryFile(
+                "w", dir=cache_file.parent, prefix="unit-", delete=False
+            ) as stream:
+                json.dump(payload, stream)
+                temporary = Path(stream.name)
+            temporary.replace(cache_file)
+        except OSError:
+            if temporary is not None:
+                temporary.unlink(missing_ok=True)
+
+    def _flow_cache_file(self) -> Optional[Path]:
+        if self.unit_cache_dir is None:
+            return None
+        return self.unit_cache_dir.parent / "flow.json"
+
+    def _read_cached_flow(self) -> Optional[dict]:
+        cache_file = self._flow_cache_file()
+        if cache_file is None:
+            return None
+        try:
+            payload = json.loads(cache_file.read_text())
+            if (
+                payload["version"] != UNIT_CACHE_VERSION
+                or payload["extractor"] != self.cache_version
+                or payload["compile_commands"]
+                != hashlib.sha256(self.compile_commands.read_bytes()).hexdigest()
+            ):
+                return None
+            for path_text, expected in payload["dependencies"].items():
+                stat = Path(path_text).stat()
+                if [stat.st_mtime_ns, stat.st_size] != expected:
+                    return None
+            data = payload["data"]
+            return data if isinstance(data, dict) else None
+        except (KeyError, OSError, TypeError, ValueError, json.JSONDecodeError):
+            return None
+
+    def _write_cached_flow(self, data: dict) -> None:
+        cache_file = self._flow_cache_file()
+        dependencies = self._dependency_stamps(self.dependencies)
+        if cache_file is None or not dependencies or self.diagnostic_count:
+            return
+        temporary: Optional[Path] = None
+        try:
+            cache_file.parent.mkdir(parents=True, exist_ok=True)
+            payload = {
+                "version": UNIT_CACHE_VERSION,
+                "extractor": self.cache_version,
+                "compile_commands": hashlib.sha256(
+                    self.compile_commands.read_bytes()
+                ).hexdigest(),
+                "dependencies": dependencies,
+                "data": data,
+            }
+            with tempfile.NamedTemporaryFile(
+                "w", dir=cache_file.parent, prefix="flow-", delete=False
+            ) as stream:
+                json.dump(payload, stream)
+                temporary = Path(stream.name)
+            temporary.replace(cache_file)
+        except OSError:
+            if temporary is not None:
+                temporary.unlink(missing_ok=True)
+
+    def _parallel_results(self, units: List[Tuple[Path, List[str]]], workers: int):
+        """Yield unit results in source order while parsing across processes."""
+        methods = multiprocessing.get_all_start_methods()
+        context = multiprocessing.get_context("fork" if "fork" in methods else "spawn")
+        selected_libclang = self.libclang_path
+        if selected_libclang is None:
+            detected = detect_host_libclang()
+            selected_libclang = str(detected) if detected is not None else None
+        with ProcessPoolExecutor(
+            max_workers=workers,
+            mp_context=context,
+            initializer=_initialize_parse_worker,
+            initargs=(selected_libclang,),
+        ) as executor:
+            yield from executor.map(_parse_unit_worker, units, chunksize=1)
 
     # ------------------------------------------------------------------
     # libclang setup
@@ -209,8 +611,9 @@ class CallGraphExtractor:
                 "the active environment."
             ) from e
 
-        if self.libclang_path:
-            path = Path(self.libclang_path)
+        libclang_path = Path(self.libclang_path) if self.libclang_path else detect_host_libclang()
+        if libclang_path is not None and not cindex.Config.loaded:
+            path = libclang_path
             if path.is_dir():
                 cindex.Config.set_library_path(str(path))
             else:
@@ -350,6 +753,7 @@ class CallGraphExtractor:
         """Parse one translation unit and fold its methods into the graph"""
         cindex = self._cindex
         index = self._index
+        self.dependencies.add(str(source.resolve()))
 
         try:
             tu = index.parse(
@@ -361,6 +765,13 @@ class CallGraphExtractor:
             logger.debug(f"  Failed to parse {source}: {e}")
             self.failed_files.append(str(source))
             return
+
+        with suppress(Exception):
+            self.dependencies.update(
+                inclusion.include.name
+                for inclusion in tu.get_includes()
+                if inclusion.include is not None and inclusion.include.name
+            )
 
         errors = [
             d for d in tu.diagnostics if d.severity >= cindex.Diagnostic.Error
@@ -737,15 +1148,72 @@ class CallGraphExtractor:
 
     def run(self) -> dict:
         """Parse every selected translation unit and produce the flow map"""
-        self._cindex = self._load_clang()
-        self._index = self._cindex.Index.create()
-
         units = self.load_translation_units()
-        logger.info(f"Parsing {len(units)} translation unit(s)")
+        cached_flow = self._read_cached_flow()
+        if cached_flow is not None:
+            logger.info(
+                f"Using cached C++ flow map ({len(units)} translation unit(s) unchanged)"
+            )
+            return cached_flow
 
-        for source, args in units:
-            logger.debug(f"Parsing {source}")
-            self.parse_unit(source, args)
+        unit_results: List[Optional[_UnitResult]] = [None] * len(units)
+        pending: List[Tuple[int, Tuple[Path, List[str]]]] = []
+        for index, (source, args) in enumerate(units):
+            cached_unit = self._read_cached_unit(source, args)
+            if cached_unit is None:
+                pending.append((index, (source, args)))
+            else:
+                unit_results[index] = cached_unit
+
+        workers = min(self.jobs, len(pending)) if pending else 1
+        logger.info(
+            f"Parsing {len(pending)} changed translation unit(s) with "
+            f"{workers} worker(s) ({len(units) - len(pending)} cached)"
+        )
+
+        progress = _TranslationUnitProgress(len(pending))
+        completed = 0
+        progress.update(completed, force=True)
+        try:
+            if pending and workers == 1:
+                cindex, clang_index = self.create_parser()
+                for completed, (index, (source, args)) in enumerate(
+                    pending, start=1
+                ):
+                    logger.debug(f"Parsing {source}")
+                    unit_extractor = CallGraphExtractor(
+                        self.compile_commands,
+                        libclang_path=self.libclang_path,
+                        system_includes=[],
+                        jobs=1,
+                    )
+                    unit_extractor.parse_unit_with(
+                        source, args, cindex, clang_index
+                    )
+                    result = _extract_unit_result(unit_extractor)
+                    unit_results[index] = result
+                    self._write_cached_unit(source, args, result)
+                    progress.update(completed)
+            elif pending:
+                pending_units = [unit for _, unit in pending]
+                for completed, ((index, (source, args)), result) in enumerate(
+                    zip(
+                        pending,
+                        self._parallel_results(pending_units, workers),
+                        strict=True,
+                    ),
+                    start=1,
+                ):
+                    unit_results[index] = result
+                    self._write_cached_unit(source, args, result)
+                    progress.update(completed)
+        finally:
+            progress.finish(completed)
+
+        for result in unit_results:
+            if result is None:
+                raise RuntimeError("C++ parsing did not produce a unit result")
+            self._merge_unit_result(result)
 
         logger.info(
             f"Parsed {self.parsed_files} file(s), "
@@ -753,16 +1221,13 @@ class CallGraphExtractor:
         )
         if self.not_generated:
             logger.info(
-                f"Skipped {len(self.not_generated)} source(s) belonging to "
-                f"modules this build did not autocode"
+                f"Skipped {len(self.not_generated)} translation unit(s) not "
+                f"produced by this deployment"
                 + (
-                    f" ({len(self.missing_autocode)} generated header(s) absent)"
+                    f" ({len(self.missing_autocode)} generated header(s) unavailable)"
                     if self.missing_autocode
                     else ""
                 )
-                + ". A component the topology instantiates but the build did "
-                "not compile will be absent from the flow map, and strict mode "
-                "will name it."
             )
         if self.failed_files:
             logger.warning(f"{len(self.failed_files)} file(s) failed to parse")
@@ -775,4 +1240,6 @@ class CallGraphExtractor:
             for path in sorted(self.files_with_errors)[:5]:
                 logger.warning(f"  {path}")
 
-        return self.build_flow_map()
+        data = self.build_flow_map()
+        self._write_cached_flow(data)
+        return data

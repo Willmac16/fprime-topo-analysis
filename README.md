@@ -70,11 +70,16 @@ deployment:
 fprime-topology-checks path/to/MyDeployment
 ```
 
-The command identifies the deployment topology and asks `fprime-util` to
-prepare the FPP model and C++ analysis information when they are not already
-available. It uses the nearest `.venv` at or above the selected deployment for
-that preparation. A project path must contain one deployment; when it contains
-several, run from the deployment source directory you want to analyze.
+The command identifies the deployment topology and runs an incremental
+`fprime-util build` before analysis, so changed FPP and C++ inputs are generated
+and built. It uses the nearest `.venv` at or above the selected deployment. A
+project path must contain one deployment; when it contains several, run from
+the deployment source directory you want to analyze.
+
+C++ flow extraction uses all logical CPU cores. Pass `-j N` to cap the worker
+count. Successful translation-unit results are cached privately; unchanged
+deployments reuse the merged flow map, and partial changes reparse only affected
+translation units.
 
 ### `guarded_port_analyzer.py` — ABBA deadlock detection
 

@@ -21,7 +21,7 @@ import json
 import logging
 import math
 import re
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from pathlib import Path
 from typing import Dict, List, Optional, Set, Tuple
 
@@ -147,7 +147,7 @@ def classify_priority_relation(
             "command handler (kind unknown) ",
             "non-handler method ",
             "unknown method",
-            "cpp:no-callsites",
+            "cpp:external-entry",
             "cpp:unknown-component",
         )
         return any(marker in context for marker in markers)
@@ -181,7 +181,7 @@ def classify_priority_relation(
     return severity, emoji
 
 
-def summarize_component_priority_status(row: QueueGroup) -> str:
+def summarize_component_priority_status(row: QueueGroup) -> List[str]:
     emoji_counts: Dict[str, int] = {}
     for group in row.inbound_ports:
         for producer in group.producers:
@@ -208,7 +208,7 @@ def summarize_component_priority_status(row: QueueGroup) -> str:
         count = emoji_counts.get(emoji, 0)
         if count > 0:
             parts.append(status_token(emoji, count))
-    return " ".join(parts)
+    return parts
 
 
 # How a call-site description from the C++ pass is abbreviated for a table
@@ -276,8 +276,8 @@ def _extract_context_parts(context: str) -> List[str]:
 def format_emit_context_for_display(context: str, producer_verbose: bool) -> str:
     if context == "cpp:autocoded-base":
         return ""
-    if context == "cpp:no-callsites":
-        return "no callsite"
+    if context == "cpp:external-entry":
+        return "external/lifecycle entry"
     if context == "cpp:unknown-component":
         return "unknown component"
 
@@ -371,18 +371,15 @@ def _producer_cells(
 def _destination_cells(row: QueueGroup) -> Dict[str, str]:
     """The cells describing one destination queue, written on its first row"""
     drain_priority = (
-        f"{row.drain_thread_priority}:"
+        str(row.drain_thread_priority)
         if row.drain_thread_priority is not None
         else "unknown"
     )
-    status = summarize_component_priority_status(row)
     return {
         "Destination Queue": row.destination,
         "Queue Size": "unknown" if row.queue_size is None else str(row.queue_size),
         "Drain Thread Kind": row.drain_thread_kind,
-        "Drain Thread Priority": (
-            f"{drain_priority} {status}".strip() if status else drain_priority
-        ),
+        "Drain Thread Priority": drain_priority,
         "Drain Sched Source": row.drain_drain_source or "",
         "Total Prod Hz": row.total_production_hz,
         "Cons Hz": row.consumer_rate_hz,
@@ -441,7 +438,17 @@ def render_markdown(
     rule = "|" + "---|" * len(columns)
     spacer = "|" + " |" * len(columns)
 
-    lines = ["# Async Queue Group Analysis", ""]
+    lines = [
+        "# Async Queue Group Analysis",
+        "",
+        "Priority relation:",
+        "",
+        "- 🔴 active producer outranks the drain thread",
+        "- 🟠 caller-thread priority is unresolved",
+        "- 🟡 queued producer outranks the drain thread",
+        "- 🟢 producer priority is below the drain thread",
+        "",
+    ]
     if not split_destination_tables:
         lines.extend([header, rule])
 
@@ -462,16 +469,19 @@ def render_markdown(
         elif rendered:
             lines.append(spacer)
 
-        destination_cells = _destination_cells(row)
-        first_row_of_destination = True
+        destination_cells = dict.fromkeys(COLUMNS, "")
+        destination_cells.update(_destination_cells(row))
+        lines.append(
+            "| " + " | ".join(f"{destination_cells[c]}" for c in columns) + " |"
+        )
+        drain_statuses = iter(summarize_component_priority_status(row))
         previous_type: Optional[str] = None
 
         for group, producers in groups:
             for index, (producer, emoji) in enumerate(producers):
                 cells = dict.fromkeys(COLUMNS, "")
                 cells.update(_producer_cells(producer, emoji, producer_verbose))
-                if first_row_of_destination:
-                    cells.update(destination_cells)
+                cells["Drain Thread Priority"] = next(drain_statuses, "")
                 if index == 0:
                     cells["Destination Port"] = group.destination_port
                     cells["Overflow Behavior"] = group.overflow_behavior
@@ -479,9 +489,14 @@ def render_markdown(
                         cells["Port Type"] = group.data_type
 
                 lines.append("| " + " | ".join(f"{cells[c]}" for c in columns) + " |")
-                first_row_of_destination = False
 
             previous_type = group.data_type
+        for status in drain_statuses:
+            status_cells = dict.fromkeys(COLUMNS, "")
+            status_cells["Drain Thread Priority"] = status
+            lines.append(
+                "| " + " | ".join(f"{status_cells[c]}" for c in columns) + " |"
+            )
         rendered += 1
 
     return "\n".join(lines) + "\n"
@@ -614,10 +629,8 @@ def emit_context_for_port(
 ) -> str:
     """Which handlers of an instance can invoke one of its output ports.
 
-    This replaces the old regex scan for ``<port>_out(`` call sites. Instead of
-    finding the call sites and then guessing which method contains them, the
-    flow map already resolved every handler to the ports it reaches, so this is
-    an inversion of a fact rather than a heuristic.
+    The flow map resolves every modeled handler to the ports it reaches. This
+    function inverts that mapping to identify the handlers that emit here.
 
     Raises:
         UnresolvedFlowError: If any handler of this component is unresolved
@@ -637,7 +650,7 @@ def emit_context_for_port(
                         emitters.append(label)
 
     if not emitters:
-        return "cpp:no-callsites"
+        return "cpp:external-entry"
     if all(label.startswith("async ") for label in emitters):
         return "cpp:async-only"
     return ", ".join(emitters)
@@ -851,6 +864,35 @@ def analyze(graph: TopologyGraph, rate_model: Dict) -> List[QueueGroup]:
     return rows
 
 
+def filter_drop_ports(rows: List[QueueGroup]) -> List[QueueGroup]:
+    """Remove async input-port groups whose queue-full behavior is drop."""
+    filtered: List[QueueGroup] = []
+    for row in rows:
+        groups = [
+            group for group in row.inbound_ports if group.overflow_behavior != "drop"
+        ]
+        if not groups:
+            continue
+        inbound = sorted({producer.source for group in groups for producer in group.producers})
+        data_types = sorted({group.data_type for group in groups})
+        production_hz: Optional[float] = None
+        for group in groups:
+            production_hz = _add_rate(production_hz, group.total_production_hz)
+        filtered.append(
+            replace(
+                row,
+                inbound_ports=groups,
+                inbound=inbound,
+                data_types=data_types,
+                total_production_hz=production_hz,
+                queue_fill_time_s=estimate_fill_time(
+                    row.queue_size, production_hz, row.consumer_rate_hz
+                ),
+            )
+        )
+    return filtered
+
+
 def format_requeue_drops(drops: List[RequeueDrop]) -> str:
     """Render the self re-queue section of the report"""
     if not drops:
@@ -942,6 +984,11 @@ def main() -> int:
         help="Hide producer rows whose priority status is green",
     )
     parser.add_argument(
+        "--hide-drop-ports",
+        action="store_true",
+        help="Hide async input ports whose queue-full behavior is drop",
+    )
+    parser.add_argument(
         "--split-destination-tables",
         action="store_true",
         help="Render one table per destination queue",
@@ -963,6 +1010,20 @@ def main() -> int:
         return cli.report_unresolved(e)
     except cli.CliError as e:
         return cli.report_error(e, args.verbose)
+
+    if args.hide_drop_ports:
+        dropped_ports = {
+            (row.destination, group.destination_port)
+            for row in rows
+            for group in row.inbound_ports
+            if group.overflow_behavior == "drop"
+        }
+        rows = filter_drop_ports(rows)
+        drops = [
+            drop
+            for drop in drops
+            if (drop.instance, drop.to_port) not in dropped_ports
+        ]
 
     if args.diagram_output:
         cli.write_or_print(render_mermaid(rows), args.diagram_output)

@@ -93,6 +93,30 @@ def test_one_way_guarded_chain_is_clean(graph_builder):
     assert ("T.a", "T.b") in analyzer.lock_edges
 
 
+def test_report_summary_is_aligned(graph_builder):
+    analyzer = analyze(graph_builder("synthetic_clean"))
+
+    summary = analyzer.format_report()
+
+    assert "Component instances:           3" in summary
+    assert "Instances with guarded ports:  2" in summary
+    assert "Lock-order edges:              1" in summary
+    assert "C++ handlers resolved:         0/9 (9 conservative)" in summary
+    assert "Intra-component flow:" not in summary
+    assert "Findings:                      0" in summary
+
+
+def test_report_summarizes_resolved_cpp_handlers(graph_builder):
+    analyzer = analyze(graph_builder("synthetic_clean"))
+    analyzer.graph.flow.stats_precise = 719
+    analyzer.graph.flow.stats_conservative = 0
+
+    summary = analyzer.format_report()
+
+    assert "C++ handlers resolved:         719/719" in summary
+    assert "strict mode" not in summary
+
+
 def test_suppression_removes_a_lock_edge(graph_builder):
     """A recorded lock ordering can be suppressed once it is enforced"""
     analyzer = analyze(graph_builder("synthetic_abba"), suppressions={("T.a", "T.b")}

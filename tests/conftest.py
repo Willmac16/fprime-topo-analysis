@@ -102,7 +102,9 @@ def flow_map_builder(tmp_path_factory):
                     ]
                 )
             )
-            cache[key] = CallGraphExtractor(compile_commands=database).run()
+            cache[key] = CallGraphExtractor(
+                compile_commands=database, jobs=1
+            ).run()
         return cache[key]
 
     return build

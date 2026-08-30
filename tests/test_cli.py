@@ -82,6 +82,9 @@ def test_help_uses_only_source_context_inputs(main, monkeypatch, capsys):
     assert "--flow-map" not in help_text
     assert "--compile-commands" not in help_text
     assert "--dot" not in help_text
+    assert "-j JOBS" in help_text
+    if main is queue_main:
+        assert "--hide-drop-ports" in help_text
 
 
 @pytest.mark.parametrize("main", [queue_main, guarded_main])
@@ -102,6 +105,7 @@ def test_checks_without_cpp_analysis_skips_dependent_checks(
     model_builder, monkeypatch, tmp_path, capsys
 ):
     _, deployment = source_project(tmp_path, model_builder("synthetic_clean"))
+    monkeypatch.setattr(cli, "_prepare_analysis", lambda _source: None)
 
     code = run(checks_main, [str(deployment), "--fail-on", "never"], monkeypatch)
 
@@ -128,6 +132,7 @@ def test_list_checks_needs_no_source_path(monkeypatch, capsys):
 
 def test_source_deployment_builds_a_graph(model_builder, monkeypatch, tmp_path, capsys):
     _, deployment = source_project(tmp_path, model_builder("synthetic_clean"))
+    monkeypatch.setattr(cli, "_prepare_analysis", lambda _source: None)
 
     code = run(
         checks_main,
@@ -162,20 +167,27 @@ def test_cpp_call_flow_is_derived_from_selected_deployment(
     )
     database = tmp_path / "Project" / "generated" / cli.COMPILE_COMMANDS
 
+    runs = 0
+
     class FakeExtractor:
         def __init__(self, **kwargs):
             assert kwargs["compile_commands"] == database
+            assert kwargs["jobs"] == 3
 
         def run(self):
+            nonlocal runs
+            runs += 1
             return {"version": 1, "components": {"Svc::Thing": {"handlers": {}}}}
 
     monkeypatch.setattr(
         "fprime_topology_analysis.component_call_graph.CallGraphExtractor",
         FakeExtractor,
     )
-    args = Namespace(path=deployment, permissive=False)
+    monkeypatch.setattr(cli, "_prepare_analysis", lambda _source: None)
+    args = Namespace(path=deployment, permissive=False, jobs=3)
 
     assert "Svc::Thing" in cli.load_flow(args).components
+    assert runs == 1
 
 
 def test_preparation_runs_from_deployment_source(monkeypatch, tmp_path):
@@ -279,6 +291,53 @@ def test_existing_release_cache_is_reconfigured(monkeypatch, tmp_path):
     assert cmake_command[4] == build_cache
     assert "-DFPRIME_ENABLE_JSON_MODEL_GENERATION=ON" in cmake_command
     assert "-DCMAKE_EXPORT_COMPILE_COMMANDS=ON" in cmake_command
+
+
+def test_configured_release_cache_runs_incremental_build(monkeypatch, tmp_path):
+    project, deployment = source_project(tmp_path)
+    executable = install_project_fprime_util(project)
+    build_cache = project / "build"
+    build_cache.mkdir()
+    (build_cache / "CMakeCache.txt").write_text(
+        f"CMAKE_HOME_DIRECTORY:INTERNAL={project}\n"
+        "FPRIME_ENABLE_JSON_MODEL_GENERATION:BOOL=ON\n"
+        "CMAKE_EXPORT_COMPILE_COMMANDS:BOOL=ON\n"
+    )
+    source = cli.resolve_deployment_source(Namespace(path=deployment))
+    calls = []
+
+    def fake_run(command, **kwargs):
+        calls.append((command, kwargs))
+        if command[1] == "info":
+            return Namespace(
+                returncode=0,
+                stdout=f"Release build cache: {build_cache}\n",
+                stderr="",
+            )
+        return Namespace(returncode=0, stdout="", stderr="")
+
+    monkeypatch.setattr(cli.subprocess, "run", fake_run)
+
+    cli._prepare_analysis(source)
+
+    assert [command[1] for command, _ in calls] == ["info", "build"]
+    assert all(command[0] == executable for command, _ in calls)
+
+
+def test_existing_artifacts_are_built_before_resolution(
+    model_builder, monkeypatch, tmp_path
+):
+    _, deployment = source_project(
+        tmp_path, model_builder("synthetic_clean"), cpp=True
+    )
+    calls = []
+
+    monkeypatch.setattr(cli, "_prepare_analysis", calls.append)
+
+    artifacts = cli.resolve_analysis_artifacts(Namespace(path=deployment))
+
+    assert calls == [cli.resolve_deployment_source(Namespace(path=deployment))]
+    assert artifacts.compile_commands is not None
 
 
 def test_preparation_failure_includes_tool_output(monkeypatch, tmp_path):

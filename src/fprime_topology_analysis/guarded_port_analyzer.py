@@ -472,11 +472,27 @@ class GuardedPortAnalyzer:
             for name, info in self.instances.items()
             if info.guarded_entries()
         }
-        lines.append(f"Component instances:      {len(self.instances)}")
-        lines.append(f"Instances w/ guarded ports: {len(guarded)}")
-        lines.append(f"Lock-order edges:         {len(self.lock_edges)}")
-        lines.append(f"Intra-component flow:     {self.graph.flow.summary()}")
-        lines.append(f"Findings:                 {len(self.findings)}")
+        flow = self.graph.flow
+        flow_lookups = flow.stats_precise + flow.stats_conservative
+        if flow_lookups:
+            flow_label = "C++ handlers resolved"
+            flow_summary = f"{flow.stats_precise}/{flow_lookups}"
+            if flow.stats_conservative:
+                flow_summary += f" ({flow.stats_conservative} conservative)"
+        else:
+            flow_label = "C++ handler flow"
+            flow_summary = "not required" if not flow.is_empty else "not available"
+        summary_rows = (
+            ("Component instances", str(len(self.instances))),
+            ("Instances with guarded ports", str(len(guarded))),
+            ("Lock-order edges", str(len(self.lock_edges))),
+            (flow_label, flow_summary),
+            ("Findings", str(len(self.findings))),
+        )
+        label_width = max(len(label) for label, _ in summary_rows) + 1
+        lines.extend(
+            f"{label + ':':<{label_width}}  {value}" for label, value in summary_rows
+        )
         if self.truncated:
             lines.append(
                 "NOTE: traversal hit a configured bound; results may be partial."
