@@ -141,7 +141,11 @@ def test_fw_cmd_queue_behavior_is_per_command(graph_builder):
 
     report = render_markdown(rows, include_rates=False)
     assert report.count("T.source.cmdOut") == 1
-    assert "| ^ | passive" in report
+    assert "T.CommandTarget" in report
+    keep_line = next(line for line in report.splitlines() if "cmdIn:KEEP" in line)
+    assert "T.source.cmdOut" not in keep_line
+    assert "passive" not in keep_line
+    assert "^" not in report
 
     filtered = filter_drop_ports(rows)
 

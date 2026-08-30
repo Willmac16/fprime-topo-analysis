@@ -67,6 +67,7 @@ class QueueGroup:
     total_production_hz: Optional[float]
     consumer_rate_hz: Optional[float]
     queue_fill_time_s: Optional[float]
+    destination_type: str = ""
 
 
 @dataclass
@@ -310,6 +311,7 @@ def _type_order_key(
 # nested groups. Rate columns appear only when a rate model was supplied.
 DEST_SCOPE = (
     "Destination Queue",
+    "Destination Component Type",
     "Queue Size",
     "Drain Thread Kind",
     "Drain Thread Priority",
@@ -384,6 +386,7 @@ def _destination_cells(row: QueueGroup) -> Dict[str, str]:
     )
     return {
         "Destination Queue": row.destination,
+        "Destination Component Type": row.destination_type,
         "Queue Size": "unknown" if row.queue_size is None else str(row.queue_size),
         "Drain Thread Kind": row.drain_thread_kind,
         "Drain Thread Priority": drain_priority,
@@ -490,7 +493,10 @@ def render_markdown(
                 cells = dict.fromkeys(COLUMNS, "")
                 cells.update(_producer_cells(producer, emoji, producer_verbose))
                 if producer.source and producer.source == previous_producer:
-                    cells["Async Producer"] = "^"
+                    cells["Async Producer"] = ""
+                    cells["Producer Thread Kind"] = ""
+                    cells["Producer Thread Priority"] = ""
+                    cells["Producer Sched Source"] = ""
                 else:
                     previous_producer = producer.source or None
                 cells["Drain Thread Priority"] = next(drain_statuses, "")
@@ -874,6 +880,7 @@ def analyze(graph: TopologyGraph, rate_model: Dict) -> List[QueueGroup]:
         rows.append(
             QueueGroup(
                 destination=instance_name,
+                destination_type=graph.instances[instance_name].component_name,
                 queue_size=queue.queue_size,
                 drain_thread_kind=queue.thread.kind,
                 drain_thread_priority=queue.thread.priority,
@@ -958,6 +965,7 @@ def rows_to_payload(rows: List[QueueGroup], include_rates: bool) -> List[Dict]:
     for row in rows:
         item = {
             "destination": row.destination,
+            "destination_type": row.destination_type,
             "data_types": row.data_types,
             "inbound": row.inbound,
             "inbound_by_port": [
