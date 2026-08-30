@@ -912,7 +912,9 @@ def rows_to_payload(rows: List[QueueGroup], include_rates: bool) -> List[Dict]:
             item["total_production_hz"] = row.total_production_hz
             item["consumer_rate_hz"] = row.consumer_rate_hz
             item["queue_fill_time_s"] = row.queue_fill_time_s
-            for entry, group in zip(item["inbound_by_port"], row.inbound_ports):
+            for entry, group in zip(
+                item["inbound_by_port"], row.inbound_ports, strict=True
+            ):
                 entry["total_production_hz"] = group.total_production_hz
         payload.append(item)
     return payload

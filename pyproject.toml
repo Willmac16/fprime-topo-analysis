@@ -10,9 +10,7 @@ readme = "README.md"
 requires-python = ">=3.10"
 
 dependencies = [
-    # The FPP model. fprime-python-model requires fprime-fpp>=3.3.0, and the
-    # 3.3.0 AST carries the isDeployment flag the topology selection needs.
-    # Older alphas (3.3.0a16) omit it and cannot be parsed by this model.
+    # The FPP model and deployment-topology metadata.
     "fprime-fpp>=3.3.0",
     "fprime-python-model>=3.3.1",
     # Intra-component call flow. Without it the analyses refuse to run, so
@@ -24,7 +22,6 @@ dependencies = [
 test = ["pytest>=7"]
 
 [project.scripts]
-fprime-component-call-graph = "fprime_topology_analysis.component_call_graph:main"
 fprime-guarded-port-analyzer = "fprime_topology_analysis.guarded_port_analyzer:main"
 fprime-async-queue-analyzer = "fprime_topology_analysis.async_queue_analyzer:main"
 fprime-topology-checks = "fprime_topology_analysis.topology_checks:main"

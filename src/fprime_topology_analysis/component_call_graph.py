@@ -36,8 +36,6 @@ Copyright 2026, by the California Institute of Technology.
 ALL RIGHTS RESERVED. United States Government Sponsorship acknowledged.
 """
 
-import sys
-import argparse
 import json
 import logging
 import re
@@ -207,8 +205,8 @@ class CallGraphExtractor:
             import clang.cindex as cindex
         except ImportError as e:
             raise RuntimeError(
-                "The clang Python bindings are required. Install them with "
-                "'pip install libclang'."
+                "The clang Python bindings are required. Install libclang in "
+                "the active environment."
             ) from e
 
         if self.libclang_path:
@@ -217,6 +215,36 @@ class CallGraphExtractor:
                 cindex.Config.set_library_path(str(path))
             else:
                 cindex.Config.set_library_file(str(path))
+
+        # Darwin headers expose the standard Objective-C attribute cursor range.
+        # Some Python libclang packages omit these IDs, causing Cursor.kind to
+        # raise before the walker can ignore the attributes.
+        missing_attribute_kinds = {
+            420: "NS_RETURNS_RETAINED",
+            421: "NS_RETURNS_NOT_RETAINED",
+            422: "NS_RETURNS_AUTORELEASED",
+            423: "NS_CONSUMES_SELF",
+            424: "NS_CONSUMED",
+            425: "OBJC_EXCEPTION",
+            426: "OBJC_NSOBJECT",
+            427: "OBJC_INDEPENDENT_CLASS",
+            428: "OBJC_PRECISE_LIFETIME",
+            429: "OBJC_RETURNS_INNER_POINTER",
+            430: "OBJC_REQUIRES_SUPER",
+            431: "OBJC_ROOT_CLASS",
+            432: "OBJC_SUBCLASSING_RESTRICTED",
+            433: "OBJC_EXPLICIT_PROTOCOL_IMPL",
+            434: "OBJC_DESIGNATED_INITIALIZER",
+            435: "OBJC_RUNTIME_VISIBLE",
+            436: "OBJC_BOXABLE",
+            437: "FLAG_ENUM",
+        }
+        registered_values = {
+            cursor_kind.value for cursor_kind in cindex.CursorKind.get_all_kinds()
+        }
+        for value, name in missing_attribute_kinds.items():
+            if value not in registered_values:
+                setattr(cindex.CursorKind, name, cindex.CursorKind(value))
         return cindex
 
     # ------------------------------------------------------------------
@@ -748,83 +776,3 @@ class CallGraphExtractor:
                 logger.warning(f"  {path}")
 
         return self.build_flow_map()
-
-
-def main():
-    parser = argparse.ArgumentParser(
-        description=(
-            "Extract which output ports each F' component handler invokes, "
-            "by resolving the C++ call graph with libclang"
-        ),
-        epilog="Requires CMAKE_EXPORT_COMPILE_COMMANDS=ON and 'pip install libclang'",
-    )
-    parser.add_argument(
-        "--compile-commands",
-        type=Path,
-        required=True,
-        help="Path to compile_commands.json",
-    )
-    parser.add_argument(
-        "--output", type=Path, required=True, help="Output flow map JSON path"
-    )
-    parser.add_argument(
-        "--include",
-        help="Only parse source files whose path matches this regex",
-    )
-    parser.add_argument(
-        "--exclude",
-        help="Skip source files whose path matches this regex (e.g. '/test/')",
-    )
-    parser.add_argument(
-        "--no-system-includes",
-        action="store_true",
-        help="Do not probe the host compiler for its default include paths",
-    )
-    parser.add_argument(
-        "--libclang",
-        help="Path to libclang shared library or its directory, if not on the default path",
-    )
-    parser.add_argument(
-        "--verbose", "-v", action="store_true", help="Print detailed information"
-    )
-
-    args = parser.parse_args()
-
-    log_level = logging.DEBUG if args.verbose else logging.INFO
-    logging.basicConfig(level=log_level, format="%(levelname)s: %(message)s")
-
-    extractor = CallGraphExtractor(
-        compile_commands=args.compile_commands,
-        include_pattern=args.include,
-        exclude_pattern=args.exclude,
-        libclang_path=args.libclang,
-        system_includes=[] if args.no_system_includes else None,
-    )
-
-    try:
-        flow_map = extractor.run()
-    except (RuntimeError, FileNotFoundError, ValueError) as e:
-        logger.error(f"Error: {e}")
-        return 1
-
-    args.output.parent.mkdir(parents=True, exist_ok=True)
-    args.output.write_text(json.dumps(flow_map, indent=2))
-
-    handler_count = sum(
-        len(c["handlers"]) for c in flow_map["components"].values()
-    )
-    opaque_count = sum(
-        1
-        for c in flow_map["components"].values()
-        for h in c["handlers"].values()
-        if h["opaque"]
-    )
-    logger.info(
-        f"Wrote {args.output}: {len(flow_map['components'])} component(s), "
-        f"{handler_count} handler(s), {opaque_count} opaque"
-    )
-    return 0
-
-
-if __name__ == "__main__":
-    sys.exit(main())

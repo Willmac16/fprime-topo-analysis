@@ -628,9 +628,6 @@ def main():
     cli.add_topology_args(parser)
     cli.add_report_args(parser)
     parser.add_argument(
-        "--dot", type=Path, help="Write the lock-order graph as Graphviz DOT"
-    )
-    parser.add_argument(
         "--suppress",
         type=Path,
         help="File of 'holder -> acquired' lock orderings to ignore",
@@ -675,9 +672,6 @@ def main():
     cli.write_or_print(analyzer.format_report(), args.output)
     if args.json:
         cli.write_or_print(analyzer.to_json(), args.json)
-    if args.dot:
-        cli.write_or_print(analyzer.to_dot(), args.dot)
-
     if args.fail_on == "never":
         return 0
 

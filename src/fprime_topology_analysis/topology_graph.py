@@ -27,6 +27,16 @@ from dataclasses import dataclass, field
 # Note: fpm_ prefixes on imports are intentional to make it clear which
 # classes are from fprime_python_model vs. local definitions
 from fprime_python_model.model import FprimePythonModel as fpm_FprimePythonModel
+from fprime_python_model.translators.analysis_translator import (
+    AnalysisTranslator as fpm_AnalysisTranslator,
+)
+from fprime_python_model.translators.ast_translator import AstTranslator as fpm_AstTranslator
+from fprime_python_model.translators.construct_ast_id_map import (
+    ConstructAstMap as fpm_ConstructAstMap,
+)
+from fprime_python_model.translators.loc_map_translator import (
+    translate_location_map_json as fpm_translate_location_map_json,
+)
 from fprime_python_model.semantics.topology import Topology as fpm_Topology
 from fprime_python_model.semantics.component_instance import (
     ComponentInstance as fpm_ComponentInstance,
@@ -59,6 +69,39 @@ DEFAULT_MAX_STATES = 500000
 JSON_AST_FILE = "fpp-ast.json"
 JSON_LOCATIONS_FILE = "fpp-loc-map.json"
 JSON_ANALYSIS_FILE = "fpp-analysis.json"
+
+
+class _AnalysisTranslator(fpm_AnalysisTranslator):
+    """Translate the numeric type tags emitted by the selected FPP toolchain."""
+
+    def translate_type(self, data: Dict[str, dict]):
+        type_tag = next(iter(data))
+        if type_tag in {"PrimitiveInt", "Integer"}:
+            return self.translate_int_type({type_tag: data[type_tag]})
+        if type_tag == "Float":
+            return self.translate_primitive_type({type_tag: data[type_tag]})
+        return super().translate_type(data)
+
+
+class _TopologyModel(fpm_FprimePythonModel):
+    """FPP model loader used by the topology analyses."""
+
+    def _load(self):
+        self._location_map = fpm_translate_location_map_json(
+            self.fpp_locations_json_file
+        )
+        self._ast = fpm_AstTranslator(
+            self.fpp_ast_json_file, self.location_map
+        ).translate_ast_json()
+        self._ast_id_map, self._annotated_ast_id_map = (
+            fpm_ConstructAstMap().construct_ast_map(self._ast)
+        )
+        self._analysis = _AnalysisTranslator(
+            self.ast_id_map,
+            self.annotated_ast_id_map,
+            self.fpp_analysis_json_file,
+            self.location_map,
+        ).translate_analysis_json()
 
 
 class Severity(Enum):
@@ -288,7 +331,7 @@ class TopologyGraph:
             raise FileNotFoundError(
                 f"Missing required JSON files in {self.topology_path}"
             )
-        self.model = fpm_FprimePythonModel(
+        self.model = _TopologyModel(
             str(self.topology_path / JSON_AST_FILE),
             str(self.topology_path / JSON_LOCATIONS_FILE),
             str(self.topology_path / JSON_ANALYSIS_FILE),

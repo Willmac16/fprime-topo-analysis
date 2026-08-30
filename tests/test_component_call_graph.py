@@ -12,11 +12,24 @@ ALL RIGHTS RESERVED. United States Government Sponsorship acknowledged.
 
 import pytest
 
+from fprime_topology_analysis.component_call_graph import CallGraphExtractor
 from fprime_topology_analysis.port_flow import PortFlowMap, UnresolvedFlowError
 
 
 def handlers_of(flow_map, component):
     return flow_map["components"][component]["handlers"]
+
+
+def test_libclang_darwin_attribute_cursor_kinds_are_supported(tmp_path):
+    extractor = CallGraphExtractor(
+        tmp_path / "compile_commands.json", system_includes=[]
+    )
+
+    cindex = extractor._load_clang()
+
+    for value in range(420, 438):
+        assert cindex.CursorKind.from_id(value).value == value
+    assert cindex.CursorKind.from_id(437) == cindex.CursorKind.FLAG_ENUM
 
 
 def test_handler_resolves_through_private_helpers(flow_map_builder):
@@ -83,7 +96,7 @@ def test_unknown_handler_fails_in_strict_mode(flow_map_builder):
 
 
 def test_unknown_handler_widens_in_permissive_mode(flow_map_builder):
-    """Permissive mode keeps the old widen-to-everything behavior"""
+    """Permissive mode widens unresolved handlers to every output port."""
     flow = PortFlowMap.permissive(
         flow_map_builder("TestComponentBaseStub.cpp", "TestThing.cpp")
     )

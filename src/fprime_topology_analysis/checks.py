@@ -1035,7 +1035,7 @@ def run_checks(
         # the results carry that caveat.
         if check.requires_flow and graph.flow.is_empty and graph.flow.strict:
             skipped.append(
-                f"{check.id}: needs the C++ flow map; run with --flow-map "
+                f"{check.id}: needs C++ call-flow analysis "
                 f"(or --permissive to accept the over-approximation)"
             )
             continue

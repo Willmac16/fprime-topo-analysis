@@ -70,8 +70,7 @@ def main() -> int:
         description="Run static checks over an F' topology",
         epilog="Check ids: " + ", ".join(c.id for c in CHECKS),
     )
-    # --list-checks answers without a topology, so the path cannot be required
-    cli.add_topology_args(parser, require_path=False)
+    cli.add_topology_args(parser)
     cli.add_report_args(parser)
     parser.add_argument(
         "--checks", help="Comma separated check ids to run (default: all)"
@@ -82,12 +81,9 @@ def main() -> int:
 
     if args.list_checks:
         for check in CHECKS:
-            needs = " (needs flow map)" if check.requires_flow else ""
+            needs = " (needs C++ analysis)" if check.requires_flow else ""
             print(f"{check.id:26} {check.name}{needs}")
         return 0
-
-    if args.topology_path is None:
-        parser.error("--topology-path is required unless --list-checks is given")
 
     selected = set(args.checks.split(",")) if args.checks else None
     if selected:
@@ -97,7 +93,7 @@ def main() -> int:
             return 1
 
     try:
-        # Without a flow map the flow-dependent checks report as skipped
+        # Checks whose C++ inputs are unavailable report as skipped.
         graph = cli.load_graph(args, cli.load_flow(args, allow_empty=True))
         findings, skipped = run_checks(graph, selected)
     except UnresolvedFlowError as e:
