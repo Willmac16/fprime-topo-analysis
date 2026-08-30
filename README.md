@@ -146,8 +146,14 @@ thread arrives at the lock. It is also emitted per edge in the JSON output.
 ### `async_queue_analyzer.py` — queue pressure and drain context
 
 For every component queue, the analyzer reports which producers feed it, on
-which threads, at what priorities, and — given a rate model — how fast it would
-fill. It can render Markdown, JSON, and Mermaid output.
+which threads, at what priorities, and how fast it would fill when the rate is
+statically knowable. Standard F Prime rate-group frequencies are derived from
+the deployment timer interval, `RateGroupDriver` divider configuration, topology
+port indices, and C++ handler flow. It can render Markdown, JSON, and Mermaid
+output.
+
+Pass `--rates` to include the inferred frequency and queue-rate columns. Rate
+inference requires no configuration file.
 
 Priority inversion is reported two ways, which cover different things:
 

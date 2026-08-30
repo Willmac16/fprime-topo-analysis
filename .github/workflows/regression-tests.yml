@@ -72,7 +72,7 @@ jobs:
             --output "$reports/topology-checks.md"
           fprime-guarded-port-analyzer "$deployment" --fail-on never \
             --output "$reports/guarded-ports.md"
-          fprime-async-queue-analyzer "$deployment" --hide-drop-ports \
+          fprime-async-queue-analyzer "$deployment" --hide-drop-ports --rates \
             --output "$reports/async-queues.md"
           test -s "$reports/topology-checks.md"
           test -s "$reports/guarded-ports.md"

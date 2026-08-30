@@ -82,11 +82,10 @@ class PortFlowMap:
     def permissive(cls, data: Optional[dict] = None) -> "PortFlowMap":
         """A flow map that assumes an unresolved handler calls every output.
 
-        This is the old behavior and it is deliberately opt-in. It is useful for
-        exercising topology-level dispatch rules in isolation, and for a
-        deliberate worst-case sweep. It is not appropriate for reporting real
-        findings, because unresolved handlers manufacture chains that the C++
-        may never take.
+        This opt-in mode is useful for exercising topology-level dispatch rules
+        in isolation and for a deliberate worst-case sweep. It is not appropriate
+        for reporting real findings, because unresolved handlers manufacture
+        chains that the C++ may never take.
         """
         return cls(data, strict=False)
 

@@ -26,6 +26,7 @@ from typing import Dict, List, Optional, Set, Tuple
 
 from . import cli
 from .port_flow import UnresolvedFlowError
+from .rate_groups import RateInference, infer_rate_groups
 from .topology_graph import (
     DEFAULT_QUEUE_FULL,
     STOP,
@@ -100,25 +101,11 @@ class InstanceThreadInfo:
     drain_source: Optional[str]
 
 
-def load_rate_model(path: Optional[Path]) -> Dict:
-    if path is None:
-        return {}
-    raw = path.read_text()
-    if path.suffix.lower() in {".yaml", ".yml"}:
-        try:
-            import yaml  # type: ignore
-        except ImportError as exc:
-            raise SystemExit("YAML rate files require PyYAML. Install PyYAML or use JSON.") from exc
-        data = yaml.safe_load(raw)
-    else:
-        data = json.loads(raw)
-    if not isinstance(data, dict):
-        raise SystemExit("Rate model must be a JSON/YAML object.")
-    return data
-
-
 def lookup_rate(rate_model: Dict, keys: List[str]) -> Optional[float]:
     for key in keys:
+        direct = rate_model.get(key)
+        if isinstance(direct, (int, float)):
+            return float(direct)
         value = rate_model
         ok = True
         for part in key.split("."):
@@ -308,7 +295,7 @@ def _type_order_key(
 # Table columns, in order. ``scope`` says when a cell repeats: a "dest" cell is
 # written once per destination queue, a "port" cell once per inbound port, and
 # a "producer" cell on every row. Repeats are blanked so the table reads as
-# nested groups. Rate columns appear only when a rate model was supplied.
+# nested groups. Rate columns appear when deployment rates can be inferred.
 DEST_SCOPE = (
     "Destination Queue",
     "Destination Component Type",
@@ -336,6 +323,10 @@ def _fill_time_cell(seconds: Optional[float]) -> str:
     if seconds is math.inf:
         return "stable (drain >= fill)"
     return "unknown" if seconds is None else f"{seconds:.3f}"
+
+
+def _frequency_cell(frequency: Optional[float]) -> str:
+    return "unknown" if frequency is None else f"{frequency:g}"
 
 
 def _producer_cells(
@@ -391,8 +382,8 @@ def _destination_cells(row: QueueGroup) -> Dict[str, str]:
         "Drain Thread Kind": row.drain_thread_kind,
         "Drain Thread Priority": drain_priority,
         "Drain Sched Source": row.drain_drain_source or "",
-        "Total Prod Hz": row.total_production_hz,
-        "Cons Hz": row.consumer_rate_hz,
+        "Total Prod Hz": _frequency_cell(row.total_production_hz),
+        "Cons Hz": _frequency_cell(row.consumer_rate_hz),
         "Fill Time (s)": _fill_time_cell(row.queue_fill_time_s),
     }
 
@@ -442,6 +433,7 @@ def render_markdown(
     split_destination_tables: bool = False,
     producer_verbose: bool = False,
     hide_green_rows: bool = False,
+    rate_groups: Optional[Dict[str, float]] = None,
 ) -> str:
     columns = [c for c in COLUMNS if include_rates or c not in RATE_COLUMNS]
     header = "| " + " | ".join(columns) + " |"
@@ -459,6 +451,17 @@ def render_markdown(
         "- 🟢 producer priority is below the drain thread",
         "",
     ]
+    if rate_groups:
+        lines.extend(
+            [
+                "Rate groups: "
+                + ", ".join(
+                    f"{name}={frequency:g} Hz"
+                    for name, frequency in sorted(rate_groups.items())
+                ),
+                "",
+            ]
+        )
     if not split_destination_tables:
         lines.extend([header, rule])
 
@@ -766,6 +769,7 @@ class _PortQueue:
     producers: List[InboundProducer] = field(default_factory=list)
     sources: Set[str] = field(default_factory=set)
     production_hz: Optional[float] = None
+    has_unknown_rate: bool = False
 
 
 @dataclass
@@ -778,6 +782,7 @@ class _Queue:
     inbound: Set[str] = field(default_factory=set)
     data_types: Set[str] = field(default_factory=set)
     production_hz: Optional[float] = None
+    has_unknown_rate: bool = False
 
 
 def _destination_queue_entries(
@@ -850,6 +855,8 @@ def analyze(graph: TopologyGraph, rate_model: Dict) -> List[QueueGroup]:
             producer_overrides,
             [source_name, f"{source.instance}.{source.port}", source.instance],
         )
+        if production_hz is None:
+            queue.has_unknown_rate = True
         queue.production_hz = _add_rate(queue.production_hz, production_hz)
         producer = InboundProducer(
             source=source_name,
@@ -869,6 +876,8 @@ def analyze(graph: TopologyGraph, rate_model: Dict) -> List[QueueGroup]:
             if source_name in port_queue.sources:
                 continue
             port_queue.sources.add(source_name)
+            if production_hz is None:
+                port_queue.has_unknown_rate = True
             port_queue.production_hz = _add_rate(
                 port_queue.production_hz, production_hz
             )
@@ -892,16 +901,24 @@ def analyze(graph: TopologyGraph, rate_model: Dict) -> List[QueueGroup]:
                         data_type=data_type,
                         overflow_behavior=port_queue.overflow_behavior,
                         producers=sorted(port_queue.producers, key=lambda p: p.source),
-                        total_production_hz=port_queue.production_hz,
+                        total_production_hz=(
+                            None
+                            if port_queue.has_unknown_rate
+                            else port_queue.production_hz
+                        ),
                     )
                     for (port_name, data_type), port_queue in sorted(queue.ports.items())
                 ],
                 inbound=sorted(queue.inbound),
                 data_types=sorted(queue.data_types),
-                total_production_hz=queue.production_hz,
+                total_production_hz=(
+                    None if queue.has_unknown_rate else queue.production_hz
+                ),
                 consumer_rate_hz=consumer_rate,
                 queue_fill_time_s=estimate_fill_time(
-                    queue.queue_size, queue.production_hz, consumer_rate
+                    queue.queue_size,
+                    None if queue.has_unknown_rate else queue.production_hz,
+                    consumer_rate,
                 ),
             )
         )
@@ -919,9 +936,16 @@ def filter_drop_ports(rows: List[QueueGroup]) -> List[QueueGroup]:
             continue
         inbound = sorted({producer.source for group in groups for producer in group.producers})
         data_types = sorted({group.data_type for group in groups})
-        production_hz: Optional[float] = None
-        for group in groups:
-            production_hz = _add_rate(production_hz, group.total_production_hz)
+        known_rates = [
+            group.total_production_hz
+            for group in groups
+            if group.total_production_hz is not None
+        ]
+        production_hz = (
+            sum(known_rates)
+            if len(known_rates) == len(groups) and known_rates
+            else None
+        )
         filtered.append(
             replace(
                 row,
@@ -1015,7 +1039,11 @@ def main() -> int:
         )
     )
     cli.add_topology_args(parser)
-    parser.add_argument("--rate-model", type=Path, default=None, help="Rate model JSON")
+    parser.add_argument(
+        "--rates",
+        action="store_true",
+        help="Infer rate-group frequencies and show queue-rate columns",
+    )
     parser.add_argument("--format", choices=["markdown", "json"], default="markdown")
     parser.add_argument("--output", type=Path)
     parser.add_argument(
@@ -1044,12 +1072,22 @@ def main() -> int:
     args = cli.parse_args(parser)
     cli.configure_logging(args.verbose)
 
-    rate_model = load_rate_model(args.rate_model)
-    include_rates = args.rate_model is not None
-
     try:
         graph = cli.load_graph(args, cli.load_flow(args))
-        rows = analyze(graph, rate_model)
+        artifacts = args.analysis_artifacts
+        if artifacts.compile_commands is None:
+            raise cli.CliError(
+                f"C++ analysis data for {artifacts.deployment_dir} is unavailable."
+            )
+        rates = (
+            infer_rate_groups(graph, artifacts.compile_commands, artifacts.project_root)
+            if args.rates
+            else RateInference()
+        )
+        include_rates = args.rates and bool(rates.rate_groups)
+        if args.rates and not include_rates:
+            logger.warning("No statically configured standard rate groups were found")
+        rows = analyze(graph, rates.as_rate_model())
         drops = find_requeue_drops(graph)
     except UnresolvedFlowError as e:
         return cli.report_unresolved(e)
@@ -1074,23 +1112,23 @@ def main() -> int:
         cli.write_or_print(render_mermaid(rows), args.diagram_output)
 
     if args.format == "json":
-        rendered = json.dumps(
-            {
-                "queues": rows_to_payload(rows, include_rates),
-                "requeue_drops": [
-                    {
-                        "instance": d.instance,
-                        "from_port": d.from_port,
-                        "to_port": d.to_port,
-                        "from_priority": d.from_priority,
-                        "to_priority": d.to_priority,
-                        "witness": d.witness,
-                    }
-                    for d in drops
-                ],
-            },
-            indent=2,
-        )
+        payload = {
+            "queues": rows_to_payload(rows, include_rates),
+            "requeue_drops": [
+                {
+                    "instance": d.instance,
+                    "from_port": d.from_port,
+                    "to_port": d.to_port,
+                    "from_priority": d.from_priority,
+                    "to_priority": d.to_priority,
+                    "witness": d.witness,
+                }
+                for d in drops
+            ],
+        }
+        if include_rates:
+            payload["rate_groups_hz"] = rates.rate_groups
+        rendered = json.dumps(payload, indent=2)
     else:
         rendered = render_markdown(
             rows,
@@ -1098,6 +1136,7 @@ def main() -> int:
             split_destination_tables=args.split_destination_tables,
             producer_verbose=args.producer_verbose,
             hide_green_rows=args.hide_green_rows,
+            rate_groups=rates.rate_groups,
         ) + format_requeue_drops(drops)
 
     cli.write_or_print(rendered, args.output)

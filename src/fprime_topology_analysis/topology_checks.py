@@ -27,9 +27,21 @@ def format_report(findings: List[Finding], skipped: List[str], graph) -> str:
     lines.append("Topology Checks")
     lines.append("=" * 72)
     lines.append("")
-    lines.append(f"Component instances:  {len(graph.instances)}")
-    lines.append(f"Intra-component flow: {graph.flow.summary()}")
-    lines.append(f"Findings:             {len(findings)}")
+    flow_lookups = graph.flow.stats_precise + graph.flow.stats_conservative
+    flow_summary = (
+        f"{graph.flow.stats_precise}/{flow_lookups}"
+        if flow_lookups
+        else ("not available" if graph.flow.is_empty else "not required")
+    )
+    if graph.flow.stats_conservative:
+        flow_summary += f" ({graph.flow.stats_conservative} conservative)"
+    summary = (
+        ("Component instances", str(len(graph.instances))),
+        ("C++ handlers resolved", flow_summary),
+        ("Findings", str(len(findings))),
+    )
+    width = max(len(label) for label, _ in summary)
+    lines.extend(f"{label + ':':<{width + 2}} {value}" for label, value in summary)
     lines.append("")
 
     blocking = graph.blocking_ports()

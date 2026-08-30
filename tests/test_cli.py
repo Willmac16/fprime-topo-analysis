@@ -85,6 +85,8 @@ def test_help_uses_only_source_context_inputs(main, monkeypatch, capsys):
     assert "-j JOBS" in help_text
     if main is queue_main:
         assert "--hide-drop-ports" in help_text
+        assert "--rates" in help_text
+        assert "--rate-model" not in help_text
 
 
 @pytest.mark.parametrize("main", [queue_main, guarded_main])
