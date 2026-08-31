@@ -74,7 +74,28 @@ The command identifies the deployment topology and runs an incremental
 `fprime-util build` before analysis, so changed FPP and C++ inputs are generated
 and built. It uses the nearest `.venv` at or above the selected deployment. A
 project path must contain one deployment; when it contains several, run from
-the deployment source directory you want to analyze.
+the deployment source directory you want to analyze — or name it with
+`--deployment`:
+
+```bash
+fprime-topology-checks path/to/Project --deployment MyTopology
+```
+
+Auto-discovery keys off the `deployment topology` declaration introduced in FPP
+3.3.0. On older projects (or any that declare a deployment with the plain
+`topology NAME` form), pass `--deployment NAME` to select it explicitly.
+
+Tab-completion, including `--deployment` names, is provided via
+[argcomplete](https://kislyuk.github.io/argcomplete/). Enable it per command:
+
+```bash
+eval "$(register-python-argcomplete fprime-guarded-port-analyzer)"
+eval "$(register-python-argcomplete fprime-async-queue-analyzer)"
+eval "$(register-python-argcomplete fprime-topology-checks)"
+```
+
+Add those lines to your shell rc file to make completion permanent, or run
+`activate-global-python-argcomplete` once for all argcomplete-enabled commands.
 
 C++ flow extraction uses all logical CPU cores. Pass `-j N` to cap the worker
 count. Successful translation-unit results are cached privately; unchanged

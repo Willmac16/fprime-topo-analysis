@@ -1,4 +1,5 @@
 #!/usr/bin/env python3
+# PYTHON_ARGCOMPLETE_OK
 """
 Guarded Port Deadlock Analyzer - fprime_python_model Implementation
 
@@ -656,7 +657,7 @@ def main():
         parser.add_argument(
             flag, type=int, default=default, help=f"Maximum {what} (default {default})"
         )
-    args = parser.parse_args()
+    args = cli.parse_args(parser)
     cli.configure_logging(args.verbose)
 
     suppressions = set()

@@ -16,6 +16,10 @@ dependencies = [
     # Intra-component call flow. Without it the analyses refuse to run, so
     # this is a hard dependency rather than an extra.
     "libclang>=16",
+    # Shell tab-completion for the CLIs, including --deployment names.
+    "argcomplete>=3",
+    # Progress bar for C++ translation-unit parsing.
+    "tqdm>=4",
 ]
 
 [project.optional-dependencies]

@@ -10,7 +10,6 @@ Copyright 2026, by the California Institute of Technology.
 ALL RIGHTS RESERVED. United States Government Sponsorship acknowledged.
 """
 
-from io import StringIO
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -20,7 +19,6 @@ from fprime_topology_analysis.component_call_graph import (
     CallGraphExtractor,
     MethodInfo,
     _UnitResult,
-    _TranslationUnitProgress,
     detect_host_libclang,
 )
 from fprime_topology_analysis.port_flow import PortFlowMap, UnresolvedFlowError
@@ -30,46 +28,45 @@ def handlers_of(flow_map, component):
     return flow_map["components"][component]["handlers"]
 
 
-class TerminalBuffer(StringIO):
-    def isatty(self):
-        return True
-
-
-def test_translation_unit_progress_uses_single_terminal_line():
-    stream = TerminalBuffer()
-    times = iter((100.0, 100.0, 102.0, 104.0))
-    progress = _TranslationUnitProgress(
-        4, stream=stream, update_interval=0, clock=lambda: next(times)
+def test_extract_args_tolerates_gcc_only_warning_flags():
+    # A GCC compile database (e.g. monarch) carries -W flags clang rejects, and
+    # -Werror would turn "unknown warning option" into a hard parse failure.
+    extractor = CallGraphExtractor(
+        Path("compile_commands.json"), system_includes=[], jobs=1
     )
+    entry = {
+        "file": "Foo.cpp",
+        "arguments": [
+            "g++",
+            "-Werror",
+            "-Werror=maybe-uninitialized",
+            "-Wno-stringop-overflow",
+            "-std=c++17",
+            "-c",
+            "Foo.cpp",
+        ],
+    }
 
-    progress.update(0, force=True)
-    progress.update(2)
-    progress.finish(4)
+    args = extractor._extract_args(entry)
 
-    output = stream.getvalue()
-    assert (
-        "\r\033[2K⠋ Parsing C++ 0/4 [░░░░░░░░░░░░░░░░░░░░░░░░]   0% "
-        "00:00 ETA --:--" in output
-    )
-    assert (
-        "\r\033[2K⠹ Parsing C++ 2/4 [████████████░░░░░░░░░░░░]  50% "
-        "00:02 ETA 00:02" in output
-    )
-    assert (
-        "\r\033[2K⠼ Parsing C++ 4/4 [████████████████████████] 100% "
-        "00:04 ETA 00:00" in output
-    )
-    assert output.endswith("\n")
+    assert "-Werror" not in args
+    assert "-Werror=maybe-uninitialized" not in args
+    assert "-std=c++17" in args
+    assert "-Wno-stringop-overflow" in args
+    assert args[-1] == "-Wno-unknown-warning-option"
+    assert "g++" not in args and "-c" not in args and "Foo.cpp" not in args
 
 
-def test_translation_unit_progress_is_silent_without_terminal():
-    stream = StringIO()
-    progress = _TranslationUnitProgress(4, stream=stream, update_interval=0)
+def test_detect_system_includes_prepends_clang_resource_dir(monkeypatch):
+    # Clang's builtins must precede a GCC database's private headers, whose
+    # intrinsics use __builtin_ia32_* that clang cannot compile.
+    from fprime_topology_analysis import component_call_graph as ccg
 
-    progress.update(2, force=True)
-    progress.finish(4)
+    monkeypatch.setattr(ccg, "_clang_resource_include", lambda: "/opt/clang/include")
 
-    assert stream.getvalue() == ""
+    flags = ccg.detect_system_includes()
+
+    assert flags[:2] == ["-isystem", "/opt/clang/include"]
 
 
 def test_detect_host_libclang_from_selected_xcode(monkeypatch, tmp_path):

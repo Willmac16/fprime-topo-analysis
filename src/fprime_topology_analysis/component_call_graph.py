@@ -36,6 +36,7 @@ Copyright 2026, by the California Institute of Technology.
 ALL RIGHTS RESERVED. United States Government Sponsorship acknowledged.
 """
 
+import glob
 import hashlib
 import json
 import logging
@@ -45,12 +46,13 @@ import re
 import subprocess
 import sys
 import tempfile
-import time
 from concurrent.futures import ProcessPoolExecutor
 from contextlib import suppress
 from pathlib import Path
-from typing import Callable, Dict, List, Optional, Set, TextIO, Tuple
+from typing import Dict, List, Optional, Set, Tuple
 from dataclasses import dataclass, field
+
+from tqdm import tqdm
 
 logger = logging.getLogger(__name__)
 
@@ -95,67 +97,11 @@ LOCK_TYPE_MARKERS = ("Mutex", "ScopeLock", "Semaphore", "SpinLock")
 ASSIGN_TOKEN = "="
 INCREMENT_TOKENS = {"++", "--"}
 
-BRAILLE_SPINNER = ("⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏")
-
-
-class _TranslationUnitProgress:
-    """Render throttled translation-unit progress on one terminal line."""
-
-    def __init__(
-        self,
-        total: int,
-        *,
-        stream: Optional[TextIO] = None,
-        update_interval: float = 0.1,
-        clock: Callable[[], float] = time.monotonic,
-    ):
-        self.total = total
-        self.stream = stream or sys.stderr
-        self.update_interval = update_interval
-        self.clock = clock
-        self.started_at = self.clock()
-        self.last_update = float("-inf")
-        self.enabled = self.stream.isatty() and not logger.isEnabledFor(logging.DEBUG)
-
-    @staticmethod
-    def _duration(seconds: float) -> str:
-        seconds = max(0, int(seconds))
-        return f"{seconds // 60:02d}:{seconds % 60:02d}"
-
-    def update(self, completed: int, *, force: bool = False) -> None:
-        if not self.enabled:
-            return
-        now = self.clock()
-        if not force and now - self.last_update < self.update_interval:
-            return
-
-        fraction = completed / self.total if self.total else 1.0
-        bar_width = 24
-        filled = min(bar_width, int(bar_width * fraction))
-        bar = "█" * filled + "░" * (bar_width - filled)
-        spinner = BRAILLE_SPINNER[completed % len(BRAILLE_SPINNER)]
-        elapsed = max(0.0, now - self.started_at)
-        elapsed_text = self._duration(elapsed)
-        if completed >= self.total:
-            eta_text = "00:00"
-        elif completed > 0 and elapsed > 0:
-            eta_text = self._duration(elapsed * (self.total - completed) / completed)
-        else:
-            eta_text = "--:--"
-        percent = min(100, int(fraction * 100))
-        self.stream.write(
-            f"\r\033[2K{spinner} Parsing C++ {completed}/{self.total} "
-            f"[{bar}] {percent:3d}% {elapsed_text} ETA {eta_text}"
-        )
-        self.stream.flush()
-        self.last_update = now
-
-    def finish(self, completed: int) -> None:
-        if not self.enabled:
-            return
-        self.update(completed, force=True)
-        self.stream.write("\n")
-        self.stream.flush()
+# A GCC compile database carries warning flags libclang does not recognize
+# (e.g. -Wno-stringop-overflow, -Wno-maybe-uninitialized), and -Werror turns the
+# resulting "unknown warning option" into a hard parse error. Analysis ignores
+# warnings, so drop -Werror* and tell clang to shrug off the flags it can't parse.
+CLANG_UNKNOWN_WARNING_TOLERANCE = "-Wno-unknown-warning-option"
 
 
 def detect_host_libclang() -> Optional[Path]:
@@ -177,6 +123,38 @@ def detect_host_libclang() -> Optional[Path]:
     return library if library.is_file() else None
 
 
+def _clang_resource_include() -> Optional[str]:
+    """Clang's own builtin-header dir (stddef.h and the SSE/AVX intrinsics).
+
+    A GCC compilation database points -isystem at GCC's private compiler headers,
+    whose intrinsics (xmmintrin.h, ...) use __builtin_ia32_* builtins that clang
+    does not implement - on monarch that produced ~9.7k parse errors. Searching
+    clang's resource headers first makes clang use its own compatible versions.
+    """
+    for binary in ("clang", "clang++"):
+        try:
+            result = subprocess.run(
+                [binary, "-print-resource-dir"], capture_output=True, text=True
+            )
+        except (OSError, subprocess.SubprocessError):
+            continue
+        if result.returncode == 0 and result.stdout.strip():
+            include = Path(result.stdout.strip()) / "include"
+            if (include / "stddef.h").is_file():
+                return str(include)
+    # No clang driver on PATH: take the newest resource dir a system LLVM ships.
+    candidates = [
+        path
+        for pattern in (
+            "/usr/lib/clang/*/include",
+            "/usr/lib/llvm-*/lib/clang/*/include",
+        )
+        for path in glob.glob(pattern)
+        if (Path(path) / "stddef.h").is_file()
+    ]
+    return max(candidates, default=None)
+
+
 def detect_system_includes() -> List[str]:
     """Find the host compiler's default include paths as -isystem flags.
 
@@ -185,6 +163,10 @@ def detect_system_includes() -> List[str]:
     is not the build's compiler - does not know them. Without this, every
     translation unit fails on <stddef.h> and resolution silently degrades.
     """
+    # Clang's resource headers go first so its intrinsics/stddef win over a GCC
+    # database's private compiler include dir, which clang cannot compile.
+    resource = _clang_resource_include()
+    prefix = ["-isystem", resource] if resource else []
     for compiler, language in SYSTEM_INCLUDE_PROBES:
         try:
             result = subprocess.run(
@@ -211,12 +193,12 @@ def detect_system_includes() -> List[str]:
                     paths.append(str(candidate))
         if paths:
             logger.debug(f"System includes from {compiler}: {paths}")
-            return [flag for path in paths for flag in ("-isystem", path)]
+            return prefix + [flag for path in paths for flag in ("-isystem", path)]
 
     logger.warning(
         "Could not detect system include paths; parses may fail on standard headers"
     )
-    return []
+    return prefix
 
 
 @dataclass
@@ -714,7 +696,11 @@ class CallGraphExtractor:
                 continue
             if arg == entry.get("file"):
                 continue
+            # Warnings-as-errors would fail the parse on flags clang lacks.
+            if arg == "-Werror" or arg.startswith("-Werror="):
+                continue
             args.append(arg)
+        args.append(CLANG_UNKNOWN_WARNING_TOLERANCE)
         return args
 
     # ------------------------------------------------------------------
@@ -791,7 +777,7 @@ class CallGraphExtractor:
                 self.not_generated.append(str(source))
                 logger.debug(
                     f"  {source}: skipped, generated header not built "
-                    f"({sorted(missing)[0]})"
+                    f"({min(missing)})"
                 )
                 return
             self.diagnostic_count += len(errors)
@@ -1171,15 +1157,20 @@ class CallGraphExtractor:
             f"{workers} worker(s) ({len(units) - len(pending)} cached)"
         )
 
-        progress = _TranslationUnitProgress(len(pending))
-        completed = 0
-        progress.update(completed, force=True)
-        try:
+        with tqdm(
+            total=len(pending),
+            desc="Parsing C++",
+            unit="unit",
+            # Match the old bar: only on a real terminal, and never while
+            # --verbose logging is sharing stderr (tqdm would shred the log).
+            disable=not pending
+            or not sys.stderr.isatty()
+            or logger.isEnabledFor(logging.DEBUG),
+            file=sys.stderr,
+        ) as progress:
             if pending and workers == 1:
                 cindex, clang_index = self.create_parser()
-                for completed, (index, (source, args)) in enumerate(
-                    pending, start=1
-                ):
+                for index, (source, args) in pending:
                     logger.debug(f"Parsing {source}")
                     unit_extractor = CallGraphExtractor(
                         self.compile_commands,
@@ -1193,22 +1184,17 @@ class CallGraphExtractor:
                     result = _extract_unit_result(unit_extractor)
                     unit_results[index] = result
                     self._write_cached_unit(source, args, result)
-                    progress.update(completed)
+                    progress.update(1)
             elif pending:
                 pending_units = [unit for _, unit in pending]
-                for completed, ((index, (source, args)), result) in enumerate(
-                    zip(
-                        pending,
-                        self._parallel_results(pending_units, workers),
-                        strict=True,
-                    ),
-                    start=1,
+                for (index, (source, args)), result in zip(
+                    pending,
+                    self._parallel_results(pending_units, workers),
+                    strict=True,
                 ):
                     unit_results[index] = result
                     self._write_cached_unit(source, args, result)
-                    progress.update(completed)
-        finally:
-            progress.finish(completed)
+                    progress.update(1)
 
         for result in unit_results:
             if result is None:

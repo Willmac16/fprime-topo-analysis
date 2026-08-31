@@ -1,4 +1,5 @@
 #!/usr/bin/env python3
+# PYTHON_ARGCOMPLETE_OK
 """
 Async Queue Analyzer - hybrid FPP + C++ Implementation
 
@@ -1032,7 +1033,7 @@ def main() -> int:
     parser.add_argument(
         "--diagram-output", type=Path, default=None, help="Mermaid diagram output path"
     )
-    args = parser.parse_args()
+    args = cli.parse_args(parser)
     cli.configure_logging(args.verbose)
 
     rate_model = load_rate_model(args.rate_model)

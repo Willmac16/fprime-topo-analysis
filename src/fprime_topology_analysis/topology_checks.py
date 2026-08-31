@@ -1,4 +1,5 @@
 #!/usr/bin/env python3
+# PYTHON_ARGCOMPLETE_OK
 """
 Topology checks CLI - run every analysis over one topology
 
@@ -76,7 +77,7 @@ def main() -> int:
         "--checks", help="Comma separated check ids to run (default: all)"
     )
     parser.add_argument("--list-checks", action="store_true", help="List checks and exit")
-    args = parser.parse_args()
+    args = cli.parse_args(parser)
     cli.configure_logging(args.verbose)
 
     if args.list_checks:

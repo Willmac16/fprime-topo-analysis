@@ -28,6 +28,13 @@ logger = logging.getLogger(__name__)
 MODEL_FILES = ("fpp-ast.json", "fpp-loc-map.json", "fpp-analysis.json")
 COMPILE_COMMANDS = "compile_commands.json"
 DEPLOYMENT_RE = re.compile(r"\bdeployment\s+topology\s+([A-Za-z_][A-Za-z0-9_]*)")
+# The `deployment` keyword only exists in FPP >= 3.3.0. Auto-discovery uses it
+# to tell the deployment root from imported subtopologies; when --deployment
+# names one explicitly, that ambiguity is gone, so we match plain `topology
+# NAME` too (also matches the `deployment topology NAME` form as a substring).
+# The trailing brace is required so the word "topology" in `@` doc-comment prose
+# ("if a future topology ever ...") is not mistaken for a declaration.
+TOPOLOGY_RE = re.compile(r"\btopology\s+([A-Za-z_][A-Za-z0-9_]*)\s*\{")
 RELEASE_BUILD_CACHE_RE = re.compile(
     r"^\s*Release build cache:\s*(?P<path>.+?)\s*$", re.MULTILINE
 )
@@ -97,6 +104,35 @@ def add_topology_args(parser: argparse.ArgumentParser) -> None:
         ),
     )
     parser.add_argument("--verbose", "-v", action="store_true")
+    deployment = parser.add_argument(
+        "--deployment",
+        metavar="NAME",
+        help=(
+            "Select the deployment topology by name. Required when several "
+            "deployments exist; also accepts the plain 'topology NAME' form "
+            "used by FPP older than 3.3.0"
+        ),
+    )
+    # Read by argcomplete (see parse_args); harmless when it is absent.
+    deployment.completer = _complete_deployment
+
+
+def _complete_deployment(prefix="", parsed_args=None, **_):
+    """Tab-complete --deployment with topology names found under the path arg."""
+    try:
+        given = getattr(parsed_args, "path", None) or Path.cwd()
+        root = _project_root(Path(given).expanduser().resolve())
+        names: set[str] = set()
+        for source in _walk_files(root, ".fpp"):
+            try:
+                text = source.read_text(errors="replace")
+            except OSError:
+                continue
+            text = "\n".join(line.split("#", 1)[0] for line in text.splitlines())
+            names.update(match.group(1) for match in TOPOLOGY_RE.finditer(text))
+        return sorted(name for name in names if name.startswith(prefix))
+    except Exception:  # completion must never raise into the user's shell
+        return []
 
 
 def add_report_args(parser: argparse.ArgumentParser) -> None:
@@ -113,6 +149,21 @@ def add_report_args(parser: argparse.ArgumentParser) -> None:
         default="error",
         help="Exit non-zero when a finding at or above this severity is found",
     )
+
+
+def parse_args(parser: argparse.ArgumentParser) -> argparse.Namespace:
+    """Parse argv, wiring shell completion when argcomplete is installed.
+
+    argcomplete.autocomplete is a no-op outside a completion invocation, so this
+    is safe to call on every run.
+    """
+    try:
+        import argcomplete
+    except ImportError:
+        pass
+    else:
+        argcomplete.autocomplete(parser)
+    return parser.parse_args()
 
 
 def configure_logging(verbose: bool) -> None:
@@ -201,7 +252,12 @@ def _deployment_directory(topology_file: Path, boundary: Path) -> Path:
     return topology_file.parent
 
 
-def _deployment_declarations(root: Path, project_root: Path) -> list[DeploymentSource]:
+def _deployment_declarations(
+    root: Path, project_root: Path, name: Optional[str] = None
+) -> list[DeploymentSource]:
+    # With no name, only `deployment topology` declarations are deployments;
+    # with a name, match any `topology NAME` so older FPP projects resolve.
+    pattern = TOPOLOGY_RE if name else DEPLOYMENT_RE
     declarations: list[DeploymentSource] = []
     for source in _walk_files(root, ".fpp"):
         try:
@@ -217,7 +273,8 @@ def _deployment_declarations(root: Path, project_root: Path) -> list[DeploymentS
                     topology_file=source,
                     topology_name=match.group(1),
                 )
-                for match in DEPLOYMENT_RE.finditer(text)
+                for match in pattern.finditer(text)
+                if name is None or match.group(1) == name
             )
         )
     return declarations
@@ -231,15 +288,23 @@ def resolve_deployment_source(args) -> DeploymentSource:
     if not selected.is_dir():
         raise CliError(f"Project or deployment path is not a directory: {selected}")
 
+    name = getattr(args, "deployment", None)
     project_root = _project_root(selected)
-    declarations = _deployment_declarations(selected, project_root)
+    declarations = _deployment_declarations(selected, project_root, name)
     if not declarations and project_root != selected:
-        declarations = _deployment_declarations(project_root, project_root)
+        declarations = _deployment_declarations(project_root, project_root, name)
 
     if not declarations:
+        if name:
+            raise CliError(
+                f"No topology named '{name}' was found under {selected}. "
+                "Check the name, or drop --deployment to auto-discover a "
+                "'deployment topology' declaration."
+            )
         raise CliError(
             f"No deployment topology was found under {selected}. "
-            "Run this command from an F Prime project or deployment source directory."
+            "Run this command from an F Prime project or deployment source directory, "
+            "or pass --deployment NAME to select a plain 'topology NAME' (older FPP)."
         )
 
     unique = {
@@ -249,12 +314,18 @@ def resolve_deployment_source(args) -> DeploymentSource:
         unique.values(), key=lambda item: (item.deployment_dir, item.topology_name)
     )
     if len(declarations) > 1:
+        if name:
+            files = sorted(str(item.topology_file) for item in declarations)
+            raise CliError(
+                f"Several topologies named '{name}' were found:\n  "
+                + "\n  ".join(files[:10])
+            )
         source_dirs = sorted({item.deployment_dir for item in declarations})
         rendered = "\n  ".join(str(path) for path in source_dirs[:10])
         suffix = f"\n  ... and {len(source_dirs) - 10} more" if len(source_dirs) > 10 else ""
         raise CliError(
             "Several deployments were found. Run the command from one of these "
-            f"source directories:\n  {rendered}{suffix}"
+            f"source directories, or pass --deployment NAME:\n  {rendered}{suffix}"
         )
     return declarations[0]
 

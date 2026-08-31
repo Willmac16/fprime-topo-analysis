@@ -159,6 +159,49 @@ def test_project_with_several_deployments_requests_a_source_choice(tmp_path):
     assert str(second) in message
 
 
+def test_deployment_flag_selects_plain_topology_form(tmp_path):
+    project = tmp_path / "Project"
+    top = project / "DemoDeployment" / "Top"
+    top.mkdir(parents=True)
+    (project / "settings.ini").write_text("[fprime]\n")
+    (project / "DemoDeployment" / "CMakeLists.txt").write_text("project(Demo)\n")
+    # Older FPP (< 3.3.0): plain `topology`, no `deployment` keyword.
+    (top / "topology.fpp").write_text("module topologies {\n  topology Legacy {}\n}\n")
+
+    with pytest.raises(cli.CliError, match="No deployment topology was found"):
+        cli.resolve_deployment_source(Namespace(path=project, deployment=None))
+
+    source = cli.resolve_deployment_source(Namespace(path=project, deployment="Legacy"))
+    assert source.topology_name == "Legacy"
+    assert source.topology_file == top / "topology.fpp"
+
+
+def test_deployment_flag_disambiguates_several_deployments(tmp_path):
+    project, _ = source_project(tmp_path)
+    second = project / "OtherDeployment"
+    (second / "Top").mkdir(parents=True)
+    (second / "CMakeLists.txt").write_text("project(OtherDeployment)\n")
+    (second / "Top" / "topology.fpp").write_text("deployment topology Other {}\n")
+
+    source = cli.resolve_deployment_source(Namespace(path=project, deployment="Other"))
+    assert source.topology_name == "Other"
+
+
+def test_unknown_deployment_name_is_reported(tmp_path):
+    project, _ = source_project(tmp_path)
+    with pytest.raises(cli.CliError, match="No topology named 'Nope'"):
+        cli.resolve_deployment_source(Namespace(path=project, deployment="Nope"))
+
+
+def test_complete_deployment_lists_matching_topology_names(tmp_path):
+    project, _ = source_project(tmp_path)  # declares `deployment topology Test`
+
+    assert "Test" in cli._complete_deployment(parsed_args=Namespace(path=project))
+    assert cli._complete_deployment(
+        prefix="Te", parsed_args=Namespace(path=project)
+    ) == ["Test"]
+
+
 def test_cpp_call_flow_is_derived_from_selected_deployment(
     model_builder, monkeypatch, tmp_path
 ):
