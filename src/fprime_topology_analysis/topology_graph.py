@@ -60,8 +60,14 @@ STOP = object()
 # trips FW_ASSERT, which on flight hardware means FATAL and a reboot.
 DEFAULT_QUEUE_FULL = "assert"
 
-# Used when no thread origin reaches a port. Unattributed means "could be
-# anything", so consumers must widen severity on it, never narrow.
+# Prefix of a real OS-thread origin (an active/queued instance's own thread).
+# The deadlock classifier only treats these as proof of a concurrent thread;
+# <external:...> and <unknown> are not.
+THREAD_ORIGIN_PREFIX = "<thread:"
+# An unconnected input port modeled as a hand-written caller's thread.
+EXTERNAL_ORIGIN_PREFIX = "<external:"
+# Used when no thread origin reaches a port - genuinely unattributed, not proof
+# of a second thread.
 UNKNOWN_THREAD = "<unknown>"
 
 DEFAULT_MAX_STATES = 500000
@@ -809,21 +815,23 @@ class TopologyGraph:
                     if SyncKind.ASYNC in kinds:
                         origins.append(
                             (
-                                f"<thread:{name}>",
+                                f"{THREAD_ORIGIN_PREFIX}{name}>",
                                 PortKey(name, port_name),
                                 SyncKind.ASYNC,
                             )
                         )
 
-        # An unconnected input port can still be driven by hand-written code -
-        # a driver task, an ISR, main - so treat it as its own thread rather
-        # than assuming it is unreachable.
+        # Unconnected input: hand-written code (driver/ISR/main) may drive it.
+        # Skip async, though: its handler runs on the owner's own thread (seeded
+        # above), so an external origin is a phantom thread. Also hits internals.
         for name, info in self.instances.items():
             for port_name, kinds in info.input_ports.items():
                 key = PortKey(name, port_name)
                 if str(key) not in connected:
                     origins.extend(
-                        (f"<external:{key}>", key, kind) for kind in kinds
+                        (f"<external:{key}>", key, kind)
+                        for kind in kinds
+                        if kind != SyncKind.ASYNC
                     )
 
         for label, start, kind in origins:
@@ -836,6 +844,12 @@ class TopologyGraph:
         start_info = self.instances.get(start_port.instance)
         if start_info is None:
             return
+
+        # The entry port itself is reached by this origin (its caller runs on
+        # that thread), not just the ports its handler goes on to invoke. Without
+        # this an unconnected guarded entry reports <unknown> instead of its own
+        # <external:...> caller.
+        self.port_threads.setdefault(str(start_port), set()).add(origin)
 
         seen: Set[Tuple[str, str]] = set()
         queue: List[Tuple[str, str]] = [
@@ -870,6 +884,82 @@ class TopologyGraph:
         """Thread origins that can invoke one input port"""
         self.ensure_thread_origins()
         return set(self.port_threads.get(str(port), set())) or {UNKNOWN_THREAD}
+
+    def _origin_seeds(self, origin: str) -> List[Tuple[PortKey, SyncKind]]:
+        """The port(s) and dispatch kind(s) a thread-origin token is seeded from."""
+        if origin.startswith(THREAD_ORIGIN_PREFIX):
+            name = origin[len(THREAD_ORIGIN_PREFIX) : -1]
+            info = self.instances.get(name)
+            if info is None:
+                return []
+            return [
+                (PortKey(name, port), SyncKind.ASYNC)
+                for port, kinds in info.input_ports.items()
+                if SyncKind.ASYNC in kinds
+            ]
+        if origin.startswith(EXTERNAL_ORIGIN_PREFIX):
+            instance, _, port = origin[len(EXTERNAL_ORIGIN_PREFIX) : -1].rpartition(".")
+            info = self.instances.get(instance)
+            if info is None:
+                return []
+            return [
+                (PortKey(instance, port), kind)
+                for kind in info.input_ports.get(port, set())
+                if kind != SyncKind.ASYNC
+            ]
+        return []  # <unknown> has no seed
+
+    def origin_call_path(self, origin: str, entry: PortKey) -> Optional[List[str]]:
+        """One call chain from a thread origin's seed down to ``entry``.
+
+        Returns hop labels ("src -> dest [kind]") from the seeding port to the
+        hop that reaches ``entry``, or None when the origin does not reach it
+        (e.g. ``<unknown>``). Breadth-first, so the chain is a shortest one.
+        """
+        self.ensure_thread_origins()
+        seeds = self._origin_seeds(origin)
+        if not seeds:
+            return None
+        # The caller drives the entry port directly (unconnected external entry).
+        if any(str(port) == str(entry) for port, _ in seeds):
+            return [f"{entry} [origin]"]
+
+        # parent[(instance, flow_entry)] = (previous node or None, label reaching it)
+        parent: Dict[Tuple[str, str], Tuple[Optional[Tuple[str, str]], str]] = {}
+        queue: List[Tuple[str, str]] = []
+        for port, kind in seeds:
+            info = self.instances.get(port.instance)
+            if info is None:
+                continue
+            for flow_entry in info.flow_entries(port.port, kind):
+                node = (port.instance, flow_entry)
+                if node not in parent:
+                    parent[node] = (None, f"{port} [origin]")
+                    queue.append(node)
+
+        while queue:
+            node = queue.pop(0)
+            instance, flow_entry = node
+            for source, dest, dest_info, kind in self.outward_hops(instance, flow_entry):
+                if kind == SyncKind.ASYNC:
+                    continue
+                hop = f"{source} -> {dest} [{kind}]"
+                if dest.instance == entry.instance and dest.port == entry.port:
+                    labels: List[str] = []
+                    cur: Optional[Tuple[str, str]] = node
+                    while cur is not None:
+                        prev, label = parent[cur]
+                        labels.append(label)
+                        cur = prev
+                    labels.reverse()
+                    labels.append(hop)
+                    return labels
+                for nxt in dest_info.flow_entries(dest.port, kind):
+                    dn = (dest.instance, nxt)
+                    if dn not in parent:
+                        parent[dn] = (node, hop)
+                        queue.append(dn)
+        return None
 
     # ------------------------------------------------------------------
     # Chain traversal

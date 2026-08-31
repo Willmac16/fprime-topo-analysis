@@ -117,8 +117,12 @@ checker like lockdep learns. Cycles in that graph are reported:
 | Finding | Meaning |
 | --- | --- |
 | `SELF_DEADLOCK` | One chain re-enters a mutex it already holds. `Os::Mutex` is not recursive, so this hangs unconditionally. |
-| `ABBA` | A lock-order cycle whose edges two different threads can drive, one taking A-then-B while the other takes B-then-A. |
-| `ABBA_SINGLE_THREAD` | A lock-order cycle only one thread can reach. It cannot interleave today, but becomes a real ABBA once a second caller is connected. |
+| `ABBA` | A lock-order cycle two distinct **real threads** (`<thread:…>`, an active/queued instance's own thread) can drive in opposite orders, one taking A-then-B while the other takes B-then-A. |
+
+A cycle no two distinct real threads are known to drive in opposite orders — only
+one thread reaches it, or the only "second thread" is an unconnected port
+(`<external:…>`, often a dead alternative) or `<unknown>` — is latent and **not
+reported**: it becomes a real ABBA only once a second thread reaches either side.
 
 Dispatch rules that drive the walk:
 
@@ -133,6 +137,11 @@ per command rather than on the `command recv` port.
 ```bash
 fprime-guarded-port-analyzer MyDeployment --fail-on error
 ```
+
+Pass `--call-chains` to print, for each finding edge, the full call chain from
+every driving thread's origin (an async input or an unconnected port) down to
+the guarded entry — the piece that precedes the witness and shows *how* each
+thread arrives at the lock. It is also emitted per edge in the JSON output.
 
 ### `async_queue_analyzer.py` — queue pressure and drain context
 

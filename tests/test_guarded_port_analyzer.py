@@ -74,14 +74,38 @@ def test_sync_passthrough_preserves_the_lock_chain(graph_builder):
     """A sync port takes no mutex but keeps the chain on the caller's thread"""
     analyzer = analyze(graph_builder("synthetic_sync_passthrough"))
 
-    cycles = cycles_of(analyzer, FindingKind.ABBA)
-    assert ("T.a", "T.c") in cycles
+    # The lock chain survives the sync hop: a locks c and c locks a, so the
+    # cycle is detected as edges (all passive here, so no live ABBA is reported).
+    assert ("T.a", "T.c") in analyzer.lock_edges
+    assert ("T.c", "T.a") in analyzer.lock_edges
 
     # The sync passthrough runs under the caller's lock but owns no mutex, so
     # it must never appear as a node in the lock-order graph
     nodes = {edge.holder for edge in analyzer.lock_edges.values()}
     nodes |= {edge.acquired for edge in analyzer.lock_edges.values()}
     assert "T.p" not in nodes
+
+
+def test_call_chains_trace_from_thread_origin_to_entry(graph_builder):
+    """--call-chains shows the path from each driving thread's origin to the entry"""
+    from fprime_topology_analysis.topology_graph import PortKey
+
+    analyzer = analyze(graph_builder("synthetic_abba"), show_call_chains=True)
+
+    # d1's own thread wakes and calls out into a.gIn.
+    path = analyzer.graph.origin_call_path("<thread:T.d1>", PortKey("T.a", "gIn"))
+    assert path == ["T.d1.wake [origin]", "T.d1.out -> T.a.gIn [guarded]"]
+
+    # An unreached origin yields no path.
+    assert analyzer.graph.origin_call_path("<unknown>", PortKey("T.a", "gIn")) is None
+
+    # The rendered report exposes the chain on the finding edges.
+    assert "reached by <thread:" in analyzer.format_report()
+
+
+def test_call_chains_are_off_by_default(graph_builder):
+    analyzer = analyze(graph_builder("synthetic_abba"))
+    assert "reached by" not in analyzer.format_report()
 
 
 def test_one_way_guarded_chain_is_clean(graph_builder):
@@ -101,7 +125,7 @@ def test_report_summary_is_aligned(graph_builder):
     assert "Component instances:           3" in summary
     assert "Instances with guarded ports:  2" in summary
     assert "Lock-order edges:              1" in summary
-    assert "C++ handlers resolved:         0/9 (9 conservative)" in summary
+    assert "C++ handlers resolved:         0/6 (6 conservative)" in summary
     assert "Intra-component flow:" not in summary
     assert "Findings:                      0" in summary
 
@@ -169,14 +193,16 @@ def test_real_tlmchan_guarded_ports_are_recognized(graph_builder):
 
 
 def test_real_tlmchan_cycle_is_detected(graph_builder):
-    """A guarded time provider that emits telemetry closes a cycle on TlmChan"""
+    """A guarded time provider that emits telemetry closes a lock-order cycle on
+    TlmChan. Only tlmChan's own thread reaches it, so the cycle is detected as
+    edges but is latent (not reported as a live ABBA)."""
     analyzer = analyze(graph_builder("real_tlmchan_cycle"))
 
-    assert ("RegTest.timeKeeper", "RegTest.tlmChan") in cycles_of(
-        analyzer, FindingKind.ABBA
-    )
     assert ("RegTest.tlmChan", "RegTest.timeKeeper") in analyzer.lock_edges
     assert ("RegTest.timeKeeper", "RegTest.tlmChan") in analyzer.lock_edges
+    assert ("RegTest.timeKeeper", "RegTest.tlmChan") not in cycles_of(
+        analyzer, FindingKind.ABBA
+    )
 
 
 def test_real_buffermanager_topology_is_clean(graph_builder):

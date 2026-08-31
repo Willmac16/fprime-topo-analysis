@@ -18,11 +18,15 @@ lock-order cycles:
 * ``SELF_DEADLOCK`` - one synchronous chain re-enters a mutex it already holds.
   ``Os::Mutex`` is not recursive, so this hangs unconditionally once the chain
   is taken.
-* ``ABBA`` - a lock-order cycle whose edges can be driven by two different
-  threads, i.e. one thread can take A-then-B while another takes B-then-A.
-* ``ABBA_SINGLE_THREAD`` - a lock-order cycle all of whose edges are only
-  reachable from a single thread. It cannot interleave today, but it becomes a
-  real ABBA the moment a second caller is connected.
+* ``ABBA`` - a lock-order cycle two distinct real threads can drive in opposite
+  orders: one thread takes A-then-B while another takes B-then-A. "Real" means a
+  ``<thread:...>`` origin (an active/queued instance's own thread).
+
+A cycle that no two distinct real threads are known to drive in opposite orders
+(only one thread reaches it, or the only "second thread" is an unconnected port -
+``<external:...>``, often a dead alternative - or ``<unknown>``) is latent, not a
+current hazard, and is *not reported*. It becomes a real ABBA only once a second
+thread reaches either side.
 
 Only ``m_guardedPortMutex`` is modeled. The parameter mutex ``m_paramLock`` is a
 leaf lock: the generated code always releases it before invoking an output port,
@@ -47,7 +51,7 @@ from . import cli
 from .port_flow import UnresolvedFlowError
 from .topology_graph import (
     STOP,
-    UNKNOWN_THREAD,
+    THREAD_ORIGIN_PREFIX,
     Hop,
     InstanceInfo,
     PortKey,
@@ -110,6 +114,7 @@ class GuardedPortAnalyzer:
         max_states: int = DEFAULT_MAX_STATES,
         max_cycles: int = DEFAULT_MAX_CYCLES,
         suppressions: Optional[Set[Tuple[str, str]]] = None,
+        show_call_chains: bool = False,
     ):
         #: A loaded graph. The analyzer is policy over it and never reads the
         #: model itself, so every analysis sees the same topology.
@@ -118,6 +123,8 @@ class GuardedPortAnalyzer:
         self.max_states = max_states
         self.max_cycles = max_cycles
         self.suppressions = suppressions or set()
+        # Attach each edge's source-thread -> entry call chains to the report.
+        self.show_call_chains = show_call_chains
         # (holder, acquired) -> representative edge
         self.lock_edges: Dict[Tuple[str, str], LockEdge] = {}
         self.findings: List[Finding] = []
@@ -385,35 +392,28 @@ class GuardedPortAnalyzer:
     def _classify_cycle(self, cycle: List[str]) -> Tuple[FindingKind, Severity, str]:
         """Decide whether a lock-order cycle can actually interleave.
 
-        A deadlock needs two threads taking the locks in opposite orders. If
-        every edge of the cycle is driven by the same single thread origin, the
-        orders cannot interleave today.
+        A live deadlock needs two *distinct real threads* taking the locks in
+        opposite orders - one edge driven by thread A, another by thread B != A.
+        Only ``<thread:...>`` origins count: an ``<external:...>`` (an unconnected
+        port, often a dead alternative) or ``<unknown>`` is not proof of a
+        concurrent thread, so a cycle whose only second "thread" is one of those
+        is latent (warning), not live (error).
         """
         edges = self._cycle_edges(cycle)
-        thread_sets = [edge.threads for edge in edges]
-
-        # An unattributed edge could be driven by anything, so it can always
-        # supply the second thread. Never let it argue a cycle down to a
-        # warning.
-        distinct_possible = any(UNKNOWN_THREAD in ts for ts in thread_sets)
-        for i in range(len(thread_sets)):
-            if distinct_possible:
-                break
-            for j in range(i + 1, len(thread_sets)):
-                for t1 in thread_sets[i]:
-                    for t2 in thread_sets[j]:
-                        if t1 != t2:
-                            distinct_possible = True
-                            break
-                    if distinct_possible:
-                        break
-                if distinct_possible:
-                    break
-            if distinct_possible:
-                break
+        real_sets = [
+            {t for t in edge.threads if t.startswith(THREAD_ORIGIN_PREFIX)}
+            for edge in edges
+        ]
+        distinct_possible = any(
+            t1 != t2
+            for i in range(len(real_sets))
+            for j in range(i + 1, len(real_sets))
+            for t1 in real_sets[i]
+            for t2 in real_sets[j]
+        )
+        order = " -> ".join([*cycle, cycle[0]])
 
         if distinct_possible:
-            order = " -> ".join([*cycle, cycle[0]])
             return (
                 FindingKind.ABBA,
                 Severity.ERROR,
@@ -422,14 +422,15 @@ class GuardedPortAnalyzer:
                 f"each other.",
             )
 
-        common = sorted(set().union(*thread_sets)) if thread_sets else []
-        order = " -> ".join([*cycle, cycle[0]])
+        real = sorted(set().union(*real_sets)) if real_sets else []
+        reach = ", ".join(real) if real else "no attributed thread"
         return (
             FindingKind.ABBA_SINGLE_THREAD,
             Severity.WARNING,
-            f"Lock order cycle {order}, but every edge is only reachable from "
-            f"{', '.join(common) or 'one thread'}. It cannot interleave today; it "
-            f"becomes a deadlock as soon as a second caller reaches either side.",
+            f"Lock order cycle {order}, but no two distinct threads are known to "
+            f"drive it in opposite orders (real threads: {reach}). It cannot "
+            f"interleave today; it becomes a deadlock as soon as a second thread "
+            f"reaches either side.",
         )
 
     def _cycle_edges(self, cycle: List[str]) -> List[LockEdge]:
@@ -448,6 +449,11 @@ class GuardedPortAnalyzer:
                 continue
             for cycle in self._elementary_cycles(component):
                 kind, severity, detail = self._classify_cycle(cycle)
+                # Latent single-thread cycles are not a current hazard - they
+                # need a second real thread wired in to deadlock - so they are
+                # not reported.
+                if kind == FindingKind.ABBA_SINGLE_THREAD:
+                    continue
                 self.findings.append(
                     Finding(
                         kind=kind,
@@ -461,6 +467,17 @@ class GuardedPortAnalyzer:
     # ------------------------------------------------------------------
     # Reporting
     # ------------------------------------------------------------------
+
+    def _edge_call_chains(self, edge: LockEdge) -> Dict[str, List[str]]:
+        """Per real thread, the call chain from its origin down to ``edge.entry``."""
+        chains: Dict[str, List[str]] = {}
+        for thread in sorted(self.graph.threads_reaching(edge.entry)):
+            if not thread.startswith(THREAD_ORIGIN_PREFIX):
+                continue
+            path = self.graph.origin_call_path(thread, edge.entry)
+            if path:
+                chains[thread] = path
+        return chains
 
     def format_report(self) -> str:
         lines: List[str] = []
@@ -522,7 +539,20 @@ class GuardedPortAnalyzer:
                     f"  While holding {edge.holder}, locks {edge.acquired}:"
                 )
                 lines.append(f"    entry:   {edge.entry}")
-                lines.append(f"    threads: {', '.join(sorted(edge.threads))}")
+                # Only real threads interleave; the many <external:...> (unconnected
+                # ports) and <unknown> are latent, so summarize them as a count.
+                real = sorted(
+                    t for t in edge.threads if t.startswith(THREAD_ORIGIN_PREFIX)
+                )
+                latent = len(edge.threads) - len(real)
+                threads_label = ", ".join(real) if real else "none attributed"
+                if latent:
+                    threads_label += f"  (+{latent} latent)"
+                lines.append(f"    threads: {threads_label}")
+                if self.show_call_chains:
+                    for thread, path in self._edge_call_chains(edge).items():
+                        lines.append(f"    reached by {thread}:")
+                        lines.extend(f"        {hop}" for hop in path)
                 lines.extend(f"      {hop}" for hop in edge.witness)
                 lines.append("")
         return "\n".join(lines)
@@ -563,6 +593,11 @@ class GuardedPortAnalyzer:
                             "entry": str(edge.entry),
                             "threads": sorted(edge.threads),
                             "witness": edge.witness,
+                            **(
+                                {"call_chains": self._edge_call_chains(edge)}
+                                if self.show_call_chains
+                                else {}
+                            ),
                         }
                         for edge in finding.edges
                     ],
@@ -649,6 +684,12 @@ def main():
         type=Path,
         help="File of 'holder -> acquired' lock orderings to ignore",
     )
+    parser.add_argument(
+        "--call-chains",
+        action="store_true",
+        help="Show, per finding edge, the full call chain from each driving "
+        "thread's origin down to the guarded entry",
+    )
     for flag, default, what in (
         ("--max-lock-depth", DEFAULT_MAX_LOCK_DEPTH, "nested guarded locks to explore"),
         ("--max-states", DEFAULT_MAX_STATES, "traversal states"),
@@ -679,6 +720,7 @@ def main():
         max_states=args.max_states,
         max_cycles=args.max_cycles,
         suppressions=suppressions,
+        show_call_chains=args.call_chains,
     )
 
     try:
