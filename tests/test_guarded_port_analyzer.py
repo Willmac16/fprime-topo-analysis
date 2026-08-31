@@ -99,8 +99,11 @@ def test_call_chains_trace_from_thread_origin_to_entry(graph_builder):
     # An unreached origin yields no path.
     assert analyzer.graph.origin_call_path("<unknown>", PortKey("T.a", "gIn")) is None
 
-    # The rendered report exposes the chain on the finding edges.
-    assert "reached by <thread:" in analyzer.format_report()
+    # The rendered report exposes the chain, with the <thread:...> wrapper
+    # stripped for legibility.
+    report = analyzer.format_report()
+    assert "reached by T.d" in report
+    assert "<thread:" not in report
 
 
 def test_call_chains_are_off_by_default(graph_builder):

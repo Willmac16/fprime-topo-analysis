@@ -466,6 +466,13 @@ class GuardedPortAnalyzer:
     # Reporting
     # ------------------------------------------------------------------
 
+    @staticmethod
+    def _thread_label(origin: str) -> str:
+        """A thread origin as shown in the report, without the <thread:...> wrap."""
+        if origin.startswith(THREAD_ORIGIN_PREFIX):
+            return origin[len(THREAD_ORIGIN_PREFIX) : -1]
+        return origin
+
     def _edge_call_chains(self, edge: LockEdge) -> Dict[str, List[str]]:
         """Per real thread, the call chain from its origin down to ``edge.entry``."""
         chains: Dict[str, List[str]] = {}
@@ -543,13 +550,14 @@ class GuardedPortAnalyzer:
                     t for t in edge.threads if t.startswith(THREAD_ORIGIN_PREFIX)
                 )
                 latent = len(edge.threads) - len(real)
-                threads_label = ", ".join(real) if real else "none attributed"
+                labels = [self._thread_label(t) for t in real]
+                threads_label = ", ".join(labels) if labels else "none attributed"
                 if latent:
                     threads_label += f"  (+{latent} latent)"
                 lines.append(f"    threads: {threads_label}")
                 if self.show_call_chains:
                     for thread, path in self._edge_call_chains(edge).items():
-                        lines.append(f"    reached by {thread}:")
+                        lines.append(f"    reached by {self._thread_label(thread)}:")
                         lines.extend(f"        {hop}" for hop in path)
                 lines.extend(f"      {hop}" for hop in edge.witness)
                 lines.append("")
