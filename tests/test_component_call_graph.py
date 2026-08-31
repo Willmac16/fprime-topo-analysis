@@ -57,6 +57,20 @@ def test_extract_args_tolerates_gcc_only_warning_flags():
     assert "g++" not in args and "-c" not in args and "Foo.cpp" not in args
 
 
+def test_spawned_os_task_resolves_ports_through_virtual_override(flow_map_builder):
+    """A driver spawns a read task in a mixin base (Os::Task), and its recv is
+    reachable only through the concrete component's sendBuffer/getBuffer
+    override - libclang sees only the abstract base at the call site."""
+    flow = flow_map_builder("DriverTask.cpp")
+
+    tasks = {
+        task["name"]: set(task["ports"])
+        for task in flow["components"]["RegTest::DriverTask"]["tasks"]
+    }
+    assert "recv" in tasks["readTask"]
+    assert "allocate" in tasks["readTask"]
+
+
 def test_detect_system_includes_prepends_clang_resource_dir(monkeypatch):
     # Clang's builtins must precede a GCC database's private headers, whose
     # intrinsics use __builtin_ia32_* that clang cannot compile.

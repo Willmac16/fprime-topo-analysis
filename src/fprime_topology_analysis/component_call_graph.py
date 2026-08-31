@@ -1051,8 +1051,13 @@ class CallGraphExtractor:
             else:
                 info.fields_read.add(member)
 
-    def _resolve(self, key: Tuple[str, str]):
+    def _resolve(self, key: Tuple[str, str], owned: Optional[Set[str]] = None):
         """Transitively resolve one handler to what it reaches.
+
+        When ``owned`` is given (the classes making up one concrete component), a
+        call through a base virtual also follows the override defined in those
+        classes - e.g. a driver read loop in the base reaches recv_out only
+        through the concrete component's sendBuffer/getBuffer override.
 
         Returns:
             (output port names, opaque, functions visited, extra recorded facts)
@@ -1088,6 +1093,16 @@ class CallGraphExtractor:
             severities |= info.event_severities
             opaque = opaque or info.opaque
             stack.extend(info.calls - seen)
+            # Virtual dispatch: a call resolved to a base (SocketComponentHelper::
+            # sendBuffer) also reaches the same-named override in the concrete
+            # component's own classes - libclang only sees the base's static type,
+            # so follow the override by name within `owned`.
+            if owned is not None:
+                for _call_cls, call_name in info.calls:
+                    for cls in owned:
+                        override = (cls, call_name)
+                        if override in self.methods and override not in seen:
+                            stack.append(override)
 
         # A field is a write wherever it is written, so reads are the rest
         extra = {
@@ -1212,7 +1227,7 @@ class CallGraphExtractor:
             )
             tasks = comp_entry.setdefault("tasks", [])
             for routine in sorted(routines):
-                ports, opaque, _visited, _extra = self._resolve(routine)
+                ports, opaque, _visited, _extra = self._resolve(routine, owned=owned)
                 tasks.append(
                     {"name": routine[1], "ports": sorted(ports), "opaque": opaque}
                 )
