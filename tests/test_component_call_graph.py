@@ -112,7 +112,7 @@ def test_parallel_parse_uses_at_most_one_worker_per_unit(monkeypatch, tmp_path):
     def fake_parallel_results(units, workers):
         selected_workers.append(workers)
         for _ in units:
-            yield _UnitResult({}, {}, 1, [], set(), 0, [], set(), set())
+            yield _UnitResult({}, {}, {}, 1, [], set(), 0, [], set(), set())
 
     monkeypatch.setattr(extractor, "_parallel_results", fake_parallel_results)
 
@@ -140,6 +140,7 @@ def test_flow_cache_reuses_unchanged_units_and_invalidates_dependencies(tmp_path
     result = _UnitResult(
         {method.key: method},
         {"Thing": "Demo.Thing"},
+        {},
         1,
         [],
         set(),
@@ -179,6 +180,7 @@ def test_unit_cache_reuses_missing_generated_header_until_it_appears(tmp_path):
     )
     args = ["-I", str(tmp_path)]
     result = _UnitResult(
+        {},
         {},
         {},
         0,

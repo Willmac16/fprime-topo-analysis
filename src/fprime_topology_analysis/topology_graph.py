@@ -60,12 +60,11 @@ STOP = object()
 # trips FW_ASSERT, which on flight hardware means FATAL and a reboot.
 DEFAULT_QUEUE_FULL = "assert"
 
-# Prefix of a real OS-thread origin (an active/queued instance's own thread).
-# The deadlock classifier only treats these as proof of a concurrent thread;
-# <external:...> and <unknown> are not.
+# Prefix of a real thread origin: an active/queued instance's own thread
+# ("<thread:inst>") or a task a component spawns via Os::Task
+# ("<thread:inst:routine>"). The deadlock classifier only treats these as proof
+# of a concurrent thread; <unknown> is not.
 THREAD_ORIGIN_PREFIX = "<thread:"
-# An unconnected input port modeled as a hand-written caller's thread.
-EXTERNAL_ORIGIN_PREFIX = "<external:"
 # Used when no thread origin reaches a port - genuinely unattributed, not proof
 # of a second thread.
 UNKNOWN_THREAD = "<unknown>"
@@ -796,17 +795,21 @@ class TopologyGraph:
     def _compute_thread_origins(self) -> None:
         """Label every input port with the thread origins that can invoke it.
 
-        An origin is a thread of control: an active or queued instance, whose
-        handlers run off its own queue, or an external caller for an entry port
-        nothing in the topology drives. Origins propagate along synchronous and
-        guarded hops and stop at async hops, because crossing an async port
-        hands the work to the target's own thread.
+        An origin is a real thread of control: an active or queued instance
+        whose handlers run off its own queue, or a thread a component spawns
+        itself in C++ via Os::Task (a driver's read/reconnect loop - not in the
+        FPP model, recovered from the call graph). Origins propagate along
+        synchronous and guarded hops and stop at async hops, because crossing an
+        async port hands the work to the target's own thread.
+
+        Unconnected ports are deliberately *not* treated as threads: an
+        unconnected getter is dead or pulled by reference, not an independent
+        thread, and modeling it as one only manufactures phantom hazards.
 
         Several analyses need this - which threads contend for a mutex, whether
         two threads reach one passive component, whether a handler is reachable
         at all - so it belongs to the graph rather than to any one of them.
         """
-        connected = self.connected_inputs()
         origins: List[Tuple[str, PortKey, SyncKind]] = []
 
         for name, info in self.instances.items():
@@ -821,18 +824,7 @@ class TopologyGraph:
                             )
                         )
 
-        # Unconnected input: hand-written code (driver/ISR/main) may drive it.
-        # Skip async, though: its handler runs on the owner's own thread (seeded
-        # above), so an external origin is a phantom thread. Also hits internals.
-        for name, info in self.instances.items():
-            for port_name, kinds in info.input_ports.items():
-                key = PortKey(name, port_name)
-                if str(key) not in connected:
-                    origins.extend(
-                        (f"<external:{key}>", key, kind)
-                        for kind in kinds
-                        if kind != SyncKind.ASYNC
-                    )
+        origins.extend(self._task_thread_origins())
 
         for label, start, kind in origins:
             self._propagate_origin(label, start, kind)
@@ -845,10 +837,9 @@ class TopologyGraph:
         if start_info is None:
             return
 
-        # The entry port itself is reached by this origin (its caller runs on
-        # that thread), not just the ports its handler goes on to invoke. Without
-        # this an unconnected guarded entry reports <unknown> instead of its own
-        # <external:...> caller.
+        # The seed port itself is reached by this origin (its caller/spawner runs
+        # on that thread), not just the ports the handler goes on to invoke - e.g.
+        # a driver task's entry into the topology.
         self.port_threads.setdefault(str(start_port), set()).add(origin)
 
         seen: Set[Tuple[str, str]] = set()
@@ -887,27 +878,63 @@ class TopologyGraph:
 
     def _origin_seeds(self, origin: str) -> List[Tuple[PortKey, SyncKind]]:
         """The port(s) and dispatch kind(s) a thread-origin token is seeded from."""
-        if origin.startswith(THREAD_ORIGIN_PREFIX):
-            name = origin[len(THREAD_ORIGIN_PREFIX) : -1]
-            info = self.instances.get(name)
-            if info is None:
-                return []
-            return [
-                (PortKey(name, port), SyncKind.ASYNC)
-                for port, kinds in info.input_ports.items()
-                if SyncKind.ASYNC in kinds
-            ]
-        if origin.startswith(EXTERNAL_ORIGIN_PREFIX):
-            instance, _, port = origin[len(EXTERNAL_ORIGIN_PREFIX) : -1].rpartition(".")
-            info = self.instances.get(instance)
-            if info is None:
-                return []
-            return [
-                (PortKey(instance, port), kind)
-                for kind in info.input_ports.get(port, set())
-                if kind != SyncKind.ASYNC
-            ]
-        return []  # <unknown> has no seed
+        if not origin.startswith(THREAD_ORIGIN_PREFIX):
+            return []  # <unknown> has no seed
+        label = origin[len(THREAD_ORIGIN_PREFIX) : -1]
+        if ":" in label:
+            # A spawned Os::Task thread ("<thread:instance:routine>"); it enters
+            # the topology at the destinations of the output ports it drives.
+            instance, routine = label.split(":", 1)
+            return self._task_output_seeds(instance, routine)
+        info = self.instances.get(label)
+        if info is None:
+            return []
+        return [
+            (PortKey(label, port), SyncKind.ASYNC)
+            for port, kinds in info.input_ports.items()
+            if SyncKind.ASYNC in kinds
+        ]
+
+    def _task_output_seeds(
+        self, instance: str, routine: str
+    ) -> List[Tuple[PortKey, SyncKind]]:
+        """Destinations of the output ports a spawned task drives, as seeds."""
+        info = self.instances.get(instance)
+        if info is None:
+            return []
+        seeds: List[Tuple[PortKey, SyncKind]] = []
+        for task in self.flow.tasks_for(info.component_name):
+            if task.get("name") != routine:
+                continue
+            for out_port in task.get("ports", ()):
+                for dest in self.destinations(instance, out_port):
+                    dest_info = self.instances.get(dest.instance)
+                    if dest_info is None:
+                        continue
+                    # Async dest queues to its own thread; the task thread stops.
+                    seeds.extend(
+                        (dest, kind)
+                        for kind in dest_info.input_ports.get(dest.port, set())
+                        if kind != SyncKind.ASYNC
+                    )
+        return seeds
+
+    def _task_thread_origins(self) -> List[Tuple[str, PortKey, SyncKind]]:
+        """Origins for threads a component spawns itself via Os::Task.
+
+        The FPP model does not show a driver's read/reconnect loop; the C++ call
+        graph found the output ports each such task drives. Each task is its own
+        thread of control, reaching the destinations of those ports (and onward).
+        """
+        origins: List[Tuple[str, PortKey, SyncKind]] = []
+        for name, info in self.instances.items():
+            for task in self.flow.tasks_for(info.component_name):
+                origin = f"{THREAD_ORIGIN_PREFIX}{name}:{task.get('name')}>"
+                origins.extend(
+                    (origin, start, kind)
+                    for start, kind in self._task_output_seeds(name, task.get("name"))
+                )
+        return origins
 
     def origin_call_path(self, origin: str, entry: PortKey) -> Optional[List[str]]:
         """One call chain from a thread origin's seed down to ``entry``.

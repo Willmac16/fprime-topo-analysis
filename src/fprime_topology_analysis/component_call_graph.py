@@ -56,8 +56,9 @@ from tqdm import tqdm
 
 logger = logging.getLogger(__name__)
 
-FLOW_FORMAT_VERSION = 1
-UNIT_CACHE_VERSION = 1
+# v2 adds per-component `tasks` (Os::Task threads a component spawns itself).
+FLOW_FORMAT_VERSION = 2
+UNIT_CACHE_VERSION = 2
 
 # Generated naming conventions used to recognize port invocations
 OUTPUT_PORT_MEMBER_RE = re.compile(r"^m_(?P<port>\w+)_OutputPort$")
@@ -222,6 +223,9 @@ class MethodInfo:
     event_severities: Set[str] = field(default_factory=set)
     # Lock-typed members this body touches, i.e. explicit synchronization
     locks_touched: Set[str] = field(default_factory=set)
+    # (class, method) routines this body hands to Os::Task - each is a thread
+    # the component spawns itself, invisible to the FPP model.
+    tasks_started: Set[Tuple[str, str]] = field(default_factory=set)
     # True when this body contains a call libclang could not resolve
     opaque: bool = False
 
@@ -234,6 +238,7 @@ class MethodInfo:
 class _UnitResult:
     methods: Dict[Tuple[str, str], MethodInfo]
     class_component: Dict[str, str]
+    class_bases: Dict[str, Set[str]]
     parsed_files: int
     failed_files: List[str]
     files_with_errors: Set[str]
@@ -275,6 +280,7 @@ def _extract_unit_result(extractor: "CallGraphExtractor") -> _UnitResult:
     return _UnitResult(
         methods=extractor.methods,
         class_component=extractor.class_component,
+        class_bases=extractor.class_bases,
         parsed_files=extractor.parsed_files,
         failed_files=extractor.failed_files,
         files_with_errors=extractor.files_with_errors,
@@ -312,6 +318,9 @@ class CallGraphExtractor:
         self.methods: Dict[Tuple[str, str], MethodInfo] = {}
         # Implementation class -> FPP component it implements, by inheritance
         self.class_component: Dict[str, str] = {}
+        # Class -> its direct base classes, so a task started in a shared mixin
+        # base (e.g. Drv::SocketComponentHelper) attributes to each driver.
+        self.class_bases: Dict[str, Set[str]] = {}
         self.parsed_files = 0
         self.failed_files: List[str] = []
         self.files_with_errors: Set[str] = set()
@@ -327,6 +336,8 @@ class CallGraphExtractor:
         """Merge one worker result in compilation-database order."""
         self.methods.update(result.methods)
         self.class_component.update(result.class_component)
+        for cls, bases in result.class_bases.items():
+            self.class_bases.setdefault(cls, set()).update(bases)
         self.parsed_files += result.parsed_files
         self.failed_files.extend(result.failed_files)
         self.files_with_errors.update(result.files_with_errors)
@@ -364,6 +375,7 @@ class CallGraphExtractor:
             "fields_written": sorted(method.fields_written),
             "event_severities": sorted(method.event_severities),
             "locks_touched": sorted(method.locks_touched),
+            "tasks_started": [list(t) for t in sorted(method.tasks_started)],
             "opaque": method.opaque,
         }
 
@@ -379,6 +391,7 @@ class CallGraphExtractor:
             fields_written=set(data["fields_written"]),
             event_severities=set(data["event_severities"]),
             locks_touched=set(data["locks_touched"]),
+            tasks_started={tuple(t) for t in data.get("tasks_started", [])},
             opaque=data["opaque"],
         )
 
@@ -389,6 +402,7 @@ class CallGraphExtractor:
                 for _, method in sorted(result.methods.items())
             ],
             "class_component": result.class_component,
+            "class_bases": {k: sorted(v) for k, v in result.class_bases.items()},
             "parsed_files": result.parsed_files,
             "failed_files": result.failed_files,
             "files_with_errors": sorted(result.files_with_errors),
@@ -403,6 +417,7 @@ class CallGraphExtractor:
         return _UnitResult(
             methods={method.key: method for method in methods},
             class_component=dict(data["class_component"]),
+            class_bases={k: set(v) for k, v in data.get("class_bases", {}).items()},
             parsed_files=data["parsed_files"],
             failed_files=list(data["failed_files"]),
             files_with_errors=set(data["files_with_errors"]),
@@ -808,9 +823,13 @@ class CallGraphExtractor:
                 continue
             base = child.referenced or child
             base_name = self._qualified_class_name(base) or base.spelling
-            if base_name and base_name.endswith(COMPONENT_BASE_SUFFIX):
+            if not base_name:
+                continue
+            # Record every base, not just the ComponentBase: a thread started in
+            # a shared mixin (Drv::SocketComponentHelper) must reach each driver.
+            self.class_bases.setdefault(cls, set()).add(base_name)
+            if base_name.endswith(COMPONENT_BASE_SUFFIX):
                 self.class_component[cls] = base_name[: -len(COMPONENT_BASE_SUFFIX)]
-                return
 
     def _walk_methods(self, cursor) -> None:
         """Find every method definition in the TU and record what it reaches"""
@@ -932,6 +951,34 @@ class CallGraphExtractor:
             return None
         return qualified
 
+    def _scan_task_start(self, node, info: MethodInfo) -> None:
+        """Record a routine handed to ``Os::Task::Arguments``.
+
+        A component that builds ``Os::Task::Arguments(name, routine, this, ...)``
+        spawns a thread running ``routine``. F' socket drivers do this for their
+        read and reconnect loops; those threads are invisible to the FPP model.
+        """
+        cindex = self._cindex
+        type_name = ""
+        with suppress(AttributeError, ValueError):
+            type_name = node.type.spelling or ""
+        if "Task::Arguments" not in type_name:
+            return
+        for arg in node.get_arguments():
+            for sub in arg.walk_preorder():
+                if sub.kind != cindex.CursorKind.DECL_REF_EXPR:
+                    continue
+                ref = sub.referenced
+                if ref is None or ref.kind not in (
+                    cindex.CursorKind.CXX_METHOD,
+                    cindex.CursorKind.FUNCTION_DECL,
+                ):
+                    continue
+                key = self._method_key(ref)
+                if key is not None:
+                    info.tasks_started.add(key)
+                    return
+
     def _scan_call(self, node, info: MethodInfo) -> None:
         """Record the callee, and anything its generated name reveals"""
         cindex = self._cindex
@@ -996,6 +1043,7 @@ class CallGraphExtractor:
                     member_refs.append((node.extent.start.offset, member))
             elif node.kind == cindex.CursorKind.CALL_EXPR:
                 self._scan_call(node, info)
+                self._scan_task_start(node, info)
 
         for offset, member in member_refs:
             if any(start <= offset < end for start, end in write_ranges):
@@ -1118,6 +1166,8 @@ class CallGraphExtractor:
                 f"{' (opaque)' if opaque else ''}"
             )
 
+        self._attach_tasks(components)
+
         return {
             "version": FLOW_FORMAT_VERSION,
             "implemented_by": dict(sorted(self.class_component.items())),
@@ -1127,6 +1177,46 @@ class CallGraphExtractor:
             "not_generated": sorted(self.not_generated),
             "components": components,
         }
+
+    def _transitive_bases(self, root: str) -> Set[str]:
+        """Every class ``root`` derives from, directly or indirectly."""
+        seen: Set[str] = set()
+        stack = [root]
+        while stack:
+            for base in self.class_bases.get(stack.pop(), ()):
+                if base not in seen:
+                    seen.add(base)
+                    stack.append(base)
+        return seen
+
+    def _attach_tasks(self, components: Dict[str, dict]) -> None:
+        """Record, per component, the Os::Task threads it spawns and the output
+        ports each drives. A task started in a shared mixin base attaches to
+        every component that inherits it (TcpClient, Udp, LinuxUartDriver, ...)."""
+        class_tasks: Dict[str, Set[Tuple[str, str]]] = {}
+        for (cls, _name), method in self.methods.items():
+            if method.tasks_started:
+                class_tasks.setdefault(cls, set()).update(method.tasks_started)
+        if not class_tasks:
+            return
+
+        for impl_cls, component in self.class_component.items():
+            owned = {impl_cls} | self._transitive_bases(impl_cls)
+            routines: Set[Tuple[str, str]] = set()
+            for owned_cls in owned:
+                routines |= class_tasks.get(owned_cls, set())
+            if not routines:
+                continue
+            comp_entry = components.setdefault(
+                component, {"class": impl_cls, "handlers": {}}
+            )
+            tasks = comp_entry.setdefault("tasks", [])
+            for routine in sorted(routines):
+                ports, opaque, _visited, _extra = self._resolve(routine)
+                tasks.append(
+                    {"name": routine[1], "ports": sorted(ports), "opaque": opaque}
+                )
+                logger.debug(f"  {component} task {routine[1]} -> {sorted(ports)}")
 
     # ------------------------------------------------------------------
     # Entry point

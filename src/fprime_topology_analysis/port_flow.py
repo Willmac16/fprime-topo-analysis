@@ -42,7 +42,8 @@ from typing import Dict, List, Optional
 
 logger = logging.getLogger(__name__)
 
-FLOW_FORMAT_VERSION = 1
+# v2 adds per-component `tasks` (Os::Task threads a component spawns itself).
+FLOW_FORMAT_VERSION = 2
 
 
 # F' implementation classes do not have to match the FPP component name. The
@@ -150,6 +151,13 @@ class PortFlowMap:
     def has_component(self, component: str) -> bool:
         """Whether the flow map covers this component at all"""
         return self._component_record(component) is not None
+
+    def tasks_for(self, component: str) -> List[dict]:
+        """Threads a component spawns itself via Os::Task, each as
+        ``{"name": routine, "ports": [...]}`` naming the output ports that task
+        drives. Empty when the C++ was not analyzed or none were found."""
+        record = self._component_record(component)
+        return record.get("tasks", []) if record else []
 
     def outputs_for(
         self,

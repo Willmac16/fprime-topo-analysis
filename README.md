@@ -117,12 +117,21 @@ checker like lockdep learns. Cycles in that graph are reported:
 | Finding | Meaning |
 | --- | --- |
 | `SELF_DEADLOCK` | One chain re-enters a mutex it already holds. `Os::Mutex` is not recursive, so this hangs unconditionally. |
-| `ABBA` | A lock-order cycle two distinct **real threads** (`<thread:…>`, an active/queued instance's own thread) can drive in opposite orders, one taking A-then-B while the other takes B-then-A. |
+| `ABBA` | A lock-order cycle two distinct **real threads** can drive in opposite orders, one taking A-then-B while the other takes B-then-A. |
+
+A **real thread** (`<thread:…>`) is an active/queued instance's own thread, or a
+thread a component spawns itself in C++ via `Os::Task` — a driver's read or
+reconnect loop, which the FPP model cannot show. The C++ analysis recovers each
+`Os::Task` routine and the output ports it drives, so the driver thread is
+tracked from those ports onward (each task is its own thread — a socket driver's
+read and reconnect loops are two). Unconnected ports are **not** threads: an
+unconnected getter is dead or pulled by reference, so treating it as a hand-driven
+thread only manufactures phantom hazards.
 
 A cycle no two distinct real threads are known to drive in opposite orders — only
-one thread reaches it, or the only "second thread" is an unconnected port
-(`<external:…>`, often a dead alternative) or `<unknown>` — is latent and **not
-reported**: it becomes a real ABBA only once a second thread reaches either side.
+one thread reaches it, or its only other attribution is `<unknown>` — is latent
+and **not reported**: it becomes a real ABBA only once a second thread reaches
+either side.
 
 Dispatch rules that drive the walk:
 

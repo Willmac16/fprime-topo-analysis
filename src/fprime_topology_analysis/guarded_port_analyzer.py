@@ -23,10 +23,9 @@ lock-order cycles:
   ``<thread:...>`` origin (an active/queued instance's own thread).
 
 A cycle that no two distinct real threads are known to drive in opposite orders
-(only one thread reaches it, or the only "second thread" is an unconnected port -
-``<external:...>``, often a dead alternative - or ``<unknown>``) is latent, not a
-current hazard, and is *not reported*. It becomes a real ABBA only once a second
-thread reaches either side.
+(only one thread reaches it, or its only other attribution is ``<unknown>``) is
+latent, not a current hazard, and is *not reported*. It becomes a real ABBA only
+once a second thread reaches either side.
 
 Only ``m_guardedPortMutex`` is modeled. The parameter mutex ``m_paramLock`` is a
 leaf lock: the generated code always releases it before invoking an output port,
@@ -394,10 +393,9 @@ class GuardedPortAnalyzer:
 
         A live deadlock needs two *distinct real threads* taking the locks in
         opposite orders - one edge driven by thread A, another by thread B != A.
-        Only ``<thread:...>`` origins count: an ``<external:...>`` (an unconnected
-        port, often a dead alternative) or ``<unknown>`` is not proof of a
-        concurrent thread, so a cycle whose only second "thread" is one of those
-        is latent (warning), not live (error).
+        Only a ``<thread:...>`` origin counts as a real thread; ``<unknown>`` is
+        not proof of a concurrent thread, so a cycle whose only "second thread"
+        is ``<unknown>`` is latent (warning), not live (error).
         """
         edges = self._cycle_edges(cycle)
         real_sets = [
@@ -539,8 +537,8 @@ class GuardedPortAnalyzer:
                     f"  While holding {edge.holder}, locks {edge.acquired}:"
                 )
                 lines.append(f"    entry:   {edge.entry}")
-                # Only real threads interleave; the many <external:...> (unconnected
-                # ports) and <unknown> are latent, so summarize them as a count.
+                # Only real <thread:...> origins interleave; <unknown> is latent,
+                # so summarize any non-thread tokens as a count.
                 real = sorted(
                     t for t in edge.threads if t.startswith(THREAD_ORIGIN_PREFIX)
                 )

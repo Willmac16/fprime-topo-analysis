@@ -108,6 +108,30 @@ def test_call_chains_are_off_by_default(graph_builder):
     assert "reached by" not in analyzer.format_report()
 
 
+def test_spawned_task_thread_reaches_its_output_destinations(graph_builder):
+    """A thread a component spawns via Os::Task is a real thread reaching the
+    destinations of the output ports that task drives (a driver read loop, which
+    the FPP model cannot show)."""
+    from fprime_topology_analysis.port_flow import PortFlowMap
+    from fprime_topology_analysis.topology_graph import PortKey
+
+    # synthetic_clean wires d.out -> a.gIn; model Driver as spawning a read task
+    # that drives `out`, so that thread must reach the guarded a.gIn.
+    flow = PortFlowMap.permissive(
+        {
+            "components": {
+                "T::Driver": {
+                    "handlers": {},
+                    "tasks": [{"name": "readTask", "ports": ["out"]}],
+                }
+            }
+        }
+    )
+    graph = graph_builder("synthetic_clean", flow=flow)
+
+    assert "<thread:T.d:readTask>" in graph.threads_reaching(PortKey("T.a", "gIn"))
+
+
 def test_one_way_guarded_chain_is_clean(graph_builder):
     """Locks taken in a single consistent order are not a hazard"""
     analyzer = analyze(graph_builder("synthetic_clean"))
