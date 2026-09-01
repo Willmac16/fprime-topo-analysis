@@ -51,6 +51,7 @@ from .port_flow import UnresolvedFlowError
 from .topology_graph import (
     STOP,
     THREAD_ORIGIN_PREFIX,
+    UNKNOWN_THREAD,
     Hop,
     InstanceInfo,
     PortKey,
@@ -164,10 +165,16 @@ class GuardedPortAnalyzer:
         the caller's locks are released before the message is serviced.
         """
         budget = [self.max_states]
+        connected = self.graph.connected_inputs()
         for name in sorted(self.instances):
             info = self.instances[name]
             for port_name in info.guarded_entries():
                 entry = PortKey(name, port_name)
+                # Nothing drives an unconnected entry, so its handler never runs
+                # and it starts no real lock chain. Walking it would only
+                # manufacture phantom edges attributed to <unknown>.
+                if str(entry) not in connected:
+                    continue
                 threads = self._entry_threads(entry)
                 logger.debug(
                     f"Walking guarded entry {entry} threads={sorted(threads)}"
@@ -549,11 +556,10 @@ class GuardedPortAnalyzer:
                 real = sorted(
                     t for t in edge.threads if t.startswith(THREAD_ORIGIN_PREFIX)
                 )
-                latent = len(edge.threads) - len(real)
                 labels = [self._thread_label(t) for t in real]
                 threads_label = ", ".join(labels) if labels else "none attributed"
-                if latent:
-                    threads_label += f"  (+{latent} latent)"
+                if UNKNOWN_THREAD in edge.threads:
+                    threads_label += "  (+unknown)"
                 lines.append(f"    threads: {threads_label}")
                 if self.show_call_chains:
                     for thread, path in self._edge_call_chains(edge).items():
