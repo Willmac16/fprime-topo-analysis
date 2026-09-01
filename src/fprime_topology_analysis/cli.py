@@ -362,6 +362,12 @@ def _model_candidates(source: DeploymentSource) -> list[tuple[Path, Optional[Pat
     candidates: list[tuple[Path, Optional[Path]]] = []
     for analysis in source.project_root.rglob("fpp-analysis.json"):
         model = analysis.parent
+        # Skip fprime-util's info sub-builds (sub-build-*): they regenerate the
+        # FPP model - often with a newer mtime than the real build - but not the
+        # full C++ autocode, so analyzing against one skips every component whose
+        # generated header it never produced.
+        if any(part.startswith("sub-build") for part in model.parts):
+            continue
         if not _is_model_dir(model) or not _path_has_suffix(model, relative_top):
             continue
         build_root = _build_root_for(model, source.project_root)

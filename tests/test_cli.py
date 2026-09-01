@@ -159,6 +159,39 @@ def test_project_with_several_deployments_requests_a_source_choice(tmp_path):
     assert str(second) in message
 
 
+def test_model_candidates_skip_info_sub_builds(tmp_path):
+    import os
+    import time
+
+    project = tmp_path / "Project"
+    top_rel = Path("DemoDeployment") / "Top"
+    full = project / "build" / top_rel
+    sub = project / "build" / "sub-build-info-cache" / top_rel
+    for d in (full, sub):
+        d.mkdir(parents=True)
+        for filename in cli.MODEL_FILES:
+            (d / filename).write_text("{}")
+    (project / "build" / cli.COMPILE_COMMANDS).write_text("[]")
+    (project / "build" / "sub-build-info-cache" / cli.COMPILE_COMMANDS).write_text("[]")
+
+    # The info sub-build's model is regenerated last, so it looks newest.
+    later = time.time() + 10
+    for filename in cli.MODEL_FILES:
+        os.utime(sub / filename, (later, later))
+
+    source = cli.DeploymentSource(
+        project_root=project,
+        deployment_dir=project / "DemoDeployment",
+        topology_file=project / "DemoDeployment" / "Top" / "topology.fpp",
+        topology_name="Test",
+    )
+    candidates = cli._model_candidates(source)
+
+    assert candidates, "the real build's model must still be a candidate"
+    assert all("sub-build-info-cache" not in model.parts for model, _ in candidates)
+    assert candidates[0][0] == full
+
+
 def test_deployment_flag_selects_plain_topology_form(tmp_path):
     project = tmp_path / "Project"
     top = project / "DemoDeployment" / "Top"
